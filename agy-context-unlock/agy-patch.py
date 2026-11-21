@@ -1230,6 +1230,7 @@ def _running_pids_for_binary(src):
             text=True,
             encoding="utf-8",
             errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         pids = []
         for line in res.stdout.splitlines():
