@@ -105,6 +105,21 @@ CLAMP_256K_X64 = bytes.fromhex(
 )
 PATCH_256K_X64 = bytes.fromhex("89d6") + b"\x90" * 12  # mov %edx, %esi + 12x nop
 
+# Gate 3 512K clamp sequences (0x7d000 = 512,000)
+CLAMP_512K_ARM64 = bytes.fromhex(
+    "04009ad2"  # mov  x4, #0xd000
+    "e400a0f2"  # movk x4, #0x7, lsl #16   (0x7d000 = 512000)
+    "7f00046b"  # cmp  w3, w4
+    "04009ad2"  # mov  x4, #0xd000
+    "e400a0f2"  # movk x4, #0x7, lsl #16
+    "6330849a"  # csel x3, x3, x4, lo
+)
+CLAMP_512K_X64 = bytes.fromhex(
+    "81fa00d00700"  # cmp  $0x7d000, %edx
+    "be00d00700"    # mov  $0x7d000, %esi
+    "0f42f2"        # cmovb %edx, %esi
+)
+
 # Gate 4A step-type dispatch (USER_INPUT = 8 and 19) and return-value plumbing
 USER_INPUT_STEP_TYPES = (0x8, 0x13)
 MOV_X2_XZR = 0xAA1F03E2   # mov x2, xzr
@@ -473,7 +488,7 @@ def _find_generic_arm64_256k_clamp(body):
     return hits
 
 
-def patch_gate3a_checkpoint(data, funcs, text_va, text_off, arch):
+def patch_gate3a_checkpoint(data, funcs, text_va, text_off, arch, limit="512k"):
     if FUNC_CHECKPOINT not in funcs:
         raise PatchError(f"symbol not found: {FUNC_CHECKPOINT}")
     entryoff, size = funcs[FUNC_CHECKPOINT]
@@ -483,15 +498,54 @@ def patch_gate3a_checkpoint(data, funcs, text_va, text_off, arch):
     fn_va = text_va + entryoff
     body = bytes(data[fn_off:fn_off + size])
 
+    if limit == "512k":
+        if arch == "arm64":
+            if body.find(CLAMP_512K_ARM64) >= 0:
+                return False, f"[Gate 3A] {FUNC_CHECKPOINT}: already clamped to 512K"
+            idx = body.find(CLAMP_256K_ARM64)
+            if idx < 0:
+                idx = body.find(NOP_ARM64 * 6)
+            if idx >= 0:
+                site = fn_off + idx
+                data[site:site + 24] = CLAMP_512K_ARM64
+                return True, (f"[Gate 3A] {FUNC_CHECKPOINT}: clamped to 512K (0x7d000) "
+                              f"@ {fn_va + idx:#x}")
+            generic = _find_generic_arm64_256k_clamp(body)
+            if len(generic) == 1:
+                rel, _length = generic[0]
+                site = fn_off + rel
+                data[site:site + len(CLAMP_512K_ARM64)] = CLAMP_512K_ARM64
+                return True, (f"[Gate 3A] {FUNC_CHECKPOINT}: clamped to 512K (0x7d000) "
+                              f"@ {fn_va + rel:#x}")
+            raise PatchError(f"{FUNC_CHECKPOINT}: clamp site not found to set 512K")
+
+        # x86-64
+        if body.find(CLAMP_512K_X64) >= 0:
+            return False, f"[Gate 3A] {FUNC_CHECKPOINT}: already clamped to 512K"
+        idx = body.find(CLAMP_256K_X64)
+        if idx < 0:
+            idx = body.find(PATCH_256K_X64)
+        if idx >= 0:
+            site = fn_off + idx
+            data[site:site + len(CLAMP_512K_X64)] = CLAMP_512K_X64
+            return True, (f"[Gate 3A] {FUNC_CHECKPOINT}: clamped to 512K (0x7d000) "
+                          f"@ {fn_va + idx:#x} (cmp/mov $0x7d000, cmovb)")
+        raise PatchError(f"{FUNC_CHECKPOINT}: clamp site not found to set 512K")
+
+    # limit == "1m" (uncapped physical limit)
     if arch == "arm64":
         nop6 = NOP_ARM64 * 6
+        if body.find(nop6) >= 0:
+            return False, f"[Gate 3A] {FUNC_CHECKPOINT}: already patched (1M uncapped)"
         idx = body.find(CLAMP_256K_ARM64)
+        if idx < 0:
+            idx = body.find(CLAMP_512K_ARM64)
         if idx >= 0:
             if body.find(CLAMP_256K_ARM64, idx + 1) >= 0:
                 raise PatchError(f"{FUNC_CHECKPOINT}: multiple 256K clamps found")
             site = fn_off + idx
             data[site:site + 24] = nop6
-            return True, (f"[Gate 3A] {FUNC_CHECKPOINT}: removed 256K (0x3e800) clamp "
+            return True, (f"[Gate 3A] {FUNC_CHECKPOINT}: removed clamp "
                           f"@ {fn_va + idx:#x} (6x nop)")
 
         generic = _find_generic_arm64_256k_clamp(body)
@@ -499,26 +553,26 @@ def patch_gate3a_checkpoint(data, funcs, text_va, text_off, arch):
             rel, length = generic[0]
             site = fn_off + rel
             data[site:site + length] = NOP_ARM64 * (length // 4)
-            return True, (f"[Gate 3A] {FUNC_CHECKPOINT}: removed 256K (0x3e800) clamp "
+            return True, (f"[Gate 3A] {FUNC_CHECKPOINT}: removed clamp "
                           f"@ {fn_va + rel:#x} ({length // 4}x nop)")
 
-        if body.find(nop6) >= 0:
-            return False, f"[Gate 3A] {FUNC_CHECKPOINT}: already patched"
-        raise PatchError(f"{FUNC_CHECKPOINT}: 256K (0x3e800) clamp pattern not found")
+        raise PatchError(f"{FUNC_CHECKPOINT}: clamp pattern not found")
 
     # x86-64
+    if body.find(PATCH_256K_X64) >= 0:
+        return False, f"[Gate 3A] {FUNC_CHECKPOINT}: already patched (1M uncapped)"
     idx = body.find(CLAMP_256K_X64)
+    if idx < 0:
+        idx = body.find(CLAMP_512K_X64)
     if idx >= 0:
         if body.find(CLAMP_256K_X64, idx + 1) >= 0:
             raise PatchError(f"{FUNC_CHECKPOINT}: multiple 256K clamps found")
         site = fn_off + idx
         data[site:site + len(PATCH_256K_X64)] = PATCH_256K_X64
-        return True, (f"[Gate 3A] {FUNC_CHECKPOINT}: removed 256K (0x3e800) clamp "
+        return True, (f"[Gate 3A] {FUNC_CHECKPOINT}: removed clamp "
                       f"@ {fn_va + idx:#x} (mov %edx,%esi + 12x nop)")
 
-    if body.find(PATCH_256K_X64) >= 0:
-        return False, f"[Gate 3A] {FUNC_CHECKPOINT}: already patched"
-    raise PatchError(f"{FUNC_CHECKPOINT}: x86-64 256K (0x3e800) clamp pattern not found")
+    raise PatchError(f"{FUNC_CHECKPOINT}: x86-64 clamp pattern not found")
 
 
 # --------------------------------------------------------------------------
@@ -665,21 +719,26 @@ def _x86_step_dispatch(body):
 
 
 def _x86_find_epilogue(body, start):
-    """Locate `add $imm,%rsp ; pop %rbp ; ret` at/after `start`.
+    """Locate `add $imm,%rsp ; pop %rbp ; ret` or `leave ; ret` at/after `start`.
 
     Returns (jump_rel, pop_rel) where jump_rel is the stack-dealloc site
     (or the `pop %rbp` site when no `add` precedes it), or None.
     """
     pop = body.find(b"\x5d\xc3", start, min(len(body), start + 64))
-    if pop < 0 or pop < 4:
-        return None
-    add = None
-    for rel in range(max(0, pop - 16), pop - 2):
-        if body[rel:rel + 3] == b"\x48\x83\xc4":       # add $imm8, %rsp
-            add = rel
-        elif body[rel:rel + 3] == b"\x48\x81\xc4":     # add $imm32, %rsp
-            add = rel
-    return (add if add is not None else pop), pop
+    if pop >= 0 and pop >= 4:
+        add = None
+        for rel in range(max(0, pop - 16), pop - 2):
+            if body[rel:rel + 3] == b"\x48\x83\xc4":       # add $imm8, %rsp
+                add = rel
+            elif body[rel:rel + 3] == b"\x48\x81\xc4":     # add $imm32, %rsp
+                add = rel
+        return (add if add is not None else pop), pop
+
+    leave = body.find(b"\xc9\xc3", start, min(len(body), start + 64))
+    if leave >= 0 and leave >= 4:
+        return leave, leave
+
+    return None
 
 
 def patch_gate4a_user_input_step(data, funcs, text_va, text_off, arch):
@@ -847,19 +906,73 @@ def patch_gate4b_oneharness_user_input(data, funcs, text_va, text_off, arch):
                       f"@ {fn_va + beq_rel:#x}")
 
     found = _scan_oneharness_x86(body)
-    if found is None:
-        raise PatchError(f"{FUNC_ONEHARNESS_STEP}: x86-64 OneHarness step "
-                         f"dispatch not found")
-    je_rel, zero_rel = found
-    patched_disp = zero_rel - (je_rel + 2)
-    if not 0 <= patched_disp <= 0x7F:
-        raise PatchError(f"{FUNC_ONEHARNESS_STEP}: x86-64 je target out of range")
-    if body[je_rel + 1] == patched_disp:
-        return False, f"[Gate 4B] {FUNC_ONEHARNESS_STEP}: already patched"
-    data[fn_off + je_rel + 1] = patched_disp
-    return True, (f"[Gate 4B] {FUNC_ONEHARNESS_STEP}: routed "
-                  f"STEP_TYPE_USER_INPUT (0xe) to zero limit "
-                  f"@ {fn_va + je_rel:#x}")
+    if found is not None:
+        je_rel, zero_rel = found
+        patched_disp = zero_rel - (je_rel + 2)
+        if not 0 <= patched_disp <= 0x7F:
+            raise PatchError(f"{FUNC_ONEHARNESS_STEP}: x86-64 je target out of range")
+        if body[je_rel + 1] == patched_disp:
+            return False, f"[Gate 4B] {FUNC_ONEHARNESS_STEP}: already patched"
+        data[fn_off + je_rel + 1] = patched_disp
+        return True, (f"[Gate 4B] {FUNC_ONEHARNESS_STEP}: routed "
+                      f"STEP_TYPE_USER_INPUT (0xe) to zero limit "
+                      f"@ {fn_va + je_rel:#x}")
+
+    # Fallback: scan for inverted branch pattern (cmp $0xe ; jne <c17> ; <load> ; jmp <end> ; cmp $0x17 ; jne ; <zero_xor>)
+    for rel in range(len(body) - 32):
+        modrm = None
+        if body[rel] == 0x83 and 0xF8 <= body[rel + 1] <= 0xFF and body[rel + 2] == 0x0E:
+            modrm = body[rel + 1]
+            jne_rel = rel + 3
+        elif body[rel] == 0x41 and rel + 4 < len(body) and body[rel + 1] == 0x83 and 0xF8 <= body[rel + 2] <= 0xFF and body[rel + 3] == 0x0E:
+            modrm = body[rel + 2]
+            jne_rel = rel + 4
+        else:
+            continue
+
+        if jne_rel + 2 >= len(body) or body[jne_rel] != 0x75:
+            continue
+        disp = body[jne_rel + 1]
+        c17_rel = jne_rel + 2 + disp
+        if c17_rel + 6 >= len(body):
+            continue
+
+        if not ((body[c17_rel] == 0x83 and body[c17_rel + 1] == modrm and body[c17_rel + 2] == 0x17) or
+                (body[c17_rel] == 0x41 and body[c17_rel + 1] == 0x83 and body[c17_rel + 2] == modrm and body[c17_rel + 3] == 0x17)):
+            continue
+
+        zero_rel = _x86_find_zeroing_xor(body, c17_rel + 3)
+        if zero_rel is None:
+            continue
+
+        if body[zero_rel] == 0x31:
+            zero_bytes = body[zero_rel:zero_rel + 2]
+        elif body[zero_rel] == 0x45 and body[zero_rel + 1] == 0x31:
+            zero_bytes = body[zero_rel:zero_rel + 3]
+        else:
+            continue
+
+        user_load_rel = jne_rel + 2
+        jmp_found = None
+        for j in range(user_load_rel, c17_rel):
+            if body[j] in (0xEB, 0xE9):
+                jmp_found = j
+                break
+        if jmp_found is None:
+            continue
+        load_len = jmp_found - user_load_rel
+        if load_len < len(zero_bytes):
+            continue
+
+        patch_bytes = zero_bytes + b"\x90" * (load_len - len(zero_bytes))
+        if body[user_load_rel:user_load_rel + load_len] == patch_bytes:
+            return False, f"[Gate 4B] {FUNC_ONEHARNESS_STEP}: already patched"
+
+        data[fn_off + user_load_rel:fn_off + user_load_rel + load_len] = patch_bytes
+        return True, (f"[Gate 4B] {FUNC_ONEHARNESS_STEP}: replaced user-step clamp with zero limit "
+                      f"@ {fn_va + user_load_rel:#x}")
+
+    raise PatchError(f"{FUNC_ONEHARNESS_STEP}: x86-64 OneHarness step dispatch not found")
 
 
 # --------------------------------------------------------------------------
@@ -1028,6 +1141,8 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--in-place", action="store_true")
     ap.add_argument("--locate", action="store_true", help="print target symbols only")
+    ap.add_argument("--limit", choices=["512k", "1m"], default="512k",
+                    help="checkpoint ceiling for Gate 3A (default: 512k)")
     args = ap.parse_args()
 
     src = os.path.abspath(os.path.expanduser(args.binary))
@@ -1074,15 +1189,16 @@ def main():
     if args.locate:
         return
 
+    gate3a = lambda d, f, va, off, a: patch_gate3a_checkpoint(d, f, va, off, a, limit=args.limit)
     is_server_only = (FUNC_OFFERS not in funcs and FUNC_STORE_CW not in funcs)
     if is_server_only:
-        print("[i] mode   : standalone language_server (Gate 3A + Gate 3B)")
-        patch_pipeline = (patch_gate3a_checkpoint, patch_gate3b_exp_checkpoint)
+        print(f"[i] mode   : standalone language_server (Gate 3A [{args.limit}] + Gate 3B)")
+        patch_pipeline = (gate3a, patch_gate3b_exp_checkpoint)
     else:
         patch_pipeline = (
             patch_gate1_ui,
             patch_gate2_store,
-            patch_gate3a_checkpoint,
+            gate3a,
             patch_gate3b_exp_checkpoint,
             patch_gate4a_user_input_step,
             patch_gate4b_oneharness_user_input,
