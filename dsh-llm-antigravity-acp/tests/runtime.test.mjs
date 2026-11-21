@@ -2,17 +2,24 @@
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { mkdtempSync, mkdirSync, readFileSync, existsSync, chmodSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, chmodSync, utimesSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { AntigravityRuntime, compactBridgeTool, DEFAULT_RELAY_AFTER_MS, MAX_EAGER_BRIDGE_TOOL_BYTES } from '../lib/runtime.js'
+import { Context } from '@deepseek-ai/cordis'
+import { acpClientVersion, AntigravityRuntime, compactBridgeTool, DEFAULT_RELAY_AFTER_MS, MAX_EAGER_BRIDGE_TOOL_BYTES } from '../lib/runtime.js'
 import { AntigravityAdapter } from '../lib/adapter.js'
 import { Config } from '../lib/config.js'
-import { toTokenUsage } from '../lib/conversation.js'
+import { classifyAgentNotice, toTokenUsage } from '../lib/conversation.js'
 import { EMPTY_INPUT_CONTINUATION, LOCKED_REPLAY_BUDGET_BYTES } from '../lib/history.js'
-import { sessionDbPath } from '../lib/usage-db.js'
+import { assertSupportedAgyVersion, checkUnlock, prepareHome, resolveAgyBinary, resolvePythonArgv, syncOAuthToken } from '../lib/preflight.js'
+import { AntigravityRemote, INVOCATIONS } from '../lib/remote.js'
+import { answerPermission, recordReportedToolCall } from '../lib/tool-bridge.js'
+import {
+  decodeGenMetadata, decodeStepMetadata,
+  evaluateDegradeFingerprint, sessionDbPath,
+} from '../lib/usage-db.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const fake = join(here, 'fake-agy.mjs')
@@ -26,6 +33,8 @@ function makeRuntime(extra = {}) {
   const mcpLog = join(home, 'mcp.jsonl')
   const config = {
     provider: 'antigravity', displayName: 'Antigravity', command: fake, home,
+    // The machine account is an ordinary list entry that reuses this Mac's login.
+    accounts: [{ id: 'default', displayName: '', home: '', enabled: true, env: {}, contextWindow: 0, system: true, visibleModels: [], priority: 1, weight: 1 }],
     contextWindow: 0, defaultEffort: 'high', autoPatch: false, patchScript: join(home, 'missing.py'),
     maxLiveSessions: 16, idleSessionTtlMs: 600_000, parkSettleMs: 80, keepAliveMs: 1_000,
     longDecodeContinuations: 3, warmup: false, quotaTtlMs: 60_000, ...extra.config,
@@ -86,7 +95,8 @@ test('single turn streams reasoning, text, exact usage, and the selected model a
   assert.match(textOf(chunks), /^echo:gemini-3\.8-flash:low:/)
   const usage = chunks.find(c => c.type === 'usage').usage
   assert.deepEqual(usage, { inputTokens: 600, outputTokens: 50, cacheReadTokens: 400, reasoningTokens: 20, totalTokens: 1050 })
-  assert.match(prompts()[0].system, /primary model of a DeepSeek Harness/)
+  assert.match(prompts()[0].system.replaceAll('\u200b', ''), /primary model of this coding session/)
+  assert.doesNotMatch(prompts()[0].system, /DeepSeek Harness/)
 })
 
 test('resolveModel declares the context window, three efforts, and in-history system updates', async () => {
@@ -98,7 +108,7 @@ test('resolveModel declares the context window, three efforts, and in-history sy
   assert.equal(info.reasoning.defaultEffort, 'medium')
   assert.equal(info.systemPromptUpdate, 'in-history')
   const listed = await adapter.listModels('antigravity')
-  assert.deepEqual(listed.map(m => m.id), ['gemini-4-argon', 'gemini-3.8-flash', 'claude-opus-5-5'])
+  assert.deepEqual(listed.map(m => m.id), ['gemini-4-carbon', 'gemini-4-argon', 'gemini-3.8-flash', 'claude-opus-5-5', 'claude-sonnet-5-5', 'gpt-oss-120b-medium'])
 })
 
 test('a tool call parks, ends the step, and resumes the same ACP turn with the DSH result', async () => {
@@ -303,6 +313,146 @@ test('agy output-limit continuation notices never reach the model output', async
   assert.match(textOf(chunks), /^echo:/)
 })
 
+test('classifyAgentNotice intercepts network-issue and high-traffic warnings without dropping quoted prose', () => {
+  assert.deepEqual(
+    classifyAgentNotice('\n⚠ There was a network issue connecting to the server, please try again.\n'),
+    { kind: 'error', code: 'TRANSPORT', message: 'There was a network issue connecting to the server, please try again.' },
+  )
+  assert.deepEqual(
+    classifyAgentNotice('⚠ Error: There was a network issue connecting to the server, please try again.'),
+    { kind: 'error', code: 'TRANSPORT', message: 'There was a network issue connecting to the server, please try again.' },
+  )
+  assert.deepEqual(classifyAgentNotice('\n⚠ '), { kind: 'hold' })
+  assert.deepEqual(classifyAgentNotice('⚠ API error (attempt '), { kind: 'hold' })
+  assert.deepEqual(classifyAgentNotice('There was a network issue connecting'), { kind: 'hold' })
+  assert.deepEqual(
+    classifyAgentNotice('There was a network issue connecting to the server, please try again.'),
+    { kind: 'hold' },
+  )
+  assert.deepEqual(
+    classifyAgentNotice('There was a network issue connecting to the server, please try again', true),
+    { kind: 'error', code: 'TRANSPORT', message: 'There was a network issue connecting to the server, please try again.' },
+  )
+  assert.deepEqual(
+    classifyAgentNotice('There was a network issue connecting to the server, please try again. This warning comes from agy.'),
+    { kind: 'emit' },
+  )
+  assert.deepEqual(
+    classifyAgentNotice('\n⚠ Our servers are experiencing high traffic right now, please try again in a minute.\n'),
+    { kind: 'error', code: 'RATE_LIMIT', message: 'Our servers are experiencing high traffic right now, please try again in a minute.' },
+  )
+})
+
+test('agy network-issue text warnings fail as retryable TRANSPORT with zero leaked text and rebuild cleanly on retry', async () => {
+  const plan = [
+    { chunks: ['\n⚠ ', 'There was a network issue ', 'connecting to the server, please try again', '.\n'] },
+    { chunks: ['There was a network issue connecting to the server, ', 'please try again'] },
+    { chunks: ['There was a network issue connecting to the server, please try again.', ' This sentence is quoted in prose.'] },
+    { chunks: ['\n⚠ There was a network issue connecting to the server, please try again.\n', 'recovered answer'] },
+    { tool: { name: 'bash', args: { command: 'pwd' } }, afterTool: { chunks: ['\n⚠ There was a network issue connecting to the server, please try again.\n'] } },
+    { text: 'after-tool retry ok' },
+  ]
+  const { adapter, prompts } = makeRuntime({ env: { FAKE_AGY_PLAN: JSON.stringify(plan) } })
+  const base = { provider: 'antigravity', model: 'gemini-4-argon', sessionId: 'S11c' }
+
+  const leaked1 = []
+  await assert.rejects(
+    async () => {
+      for await (const chunk of adapter.stream({ ...base, messages: [sys, user('u1', 'ping')] })) leaked1.push(chunk)
+    },
+    error => error?.code === 'TRANSPORT' && /\[连接中断\] There was a network issue/.test(error.message),
+  )
+  assert.deepEqual(leaked1, [])
+
+  const leaked2 = []
+  await assert.rejects(
+    async () => {
+      for await (const chunk of adapter.stream({ ...base, messages: [sys, user('u1', 'ping')] })) leaked2.push(chunk)
+    },
+    error => error?.code === 'TRANSPORT',
+  )
+  assert.deepEqual(leaked2, [])
+  assert.notEqual(prompts()[1].session, prompts()[0].session, 'a failed network turn discards the poisoned ACP session')
+
+  const quoted = await collect(adapter.stream({ ...base, messages: [sys, user('u1', 'explain it')] }))
+  assert.equal(
+    textOf(quoted),
+    'There was a network issue connecting to the server, please try again. This sentence is quoted in prose.',
+  )
+
+  const recovered = await collect(adapter.stream({ ...base, messages: [sys, user('u1', 'explain it'), assistantFrom('a1', quoted), user('u2', 'retry inline')] }))
+  assert.equal(textOf(recovered), 'recovered answer')
+
+  const step1 = await collect(adapter.stream({
+    ...base,
+    sessionId: 'S11d',
+    tools: [bash],
+    messages: [sys, user('u1', 'run pwd')],
+  }))
+  assert.equal(finishOf(step1).reason.kind, 'tool-calls')
+  const call = callsOf(step1)[0]
+  const step2Messages = [sys, user('u1', 'run pwd'), assistantFrom('a1', step1), tool('t1', call.id, '/workspace')]
+
+  const leakedStep2 = []
+  await assert.rejects(
+    async () => {
+      for await (const chunk of adapter.stream({ ...base, sessionId: 'S11d', tools: [bash], messages: step2Messages })) leakedStep2.push(chunk)
+    },
+    error => error?.code === 'TRANSPORT',
+  )
+  assert.deepEqual(leakedStep2, [])
+
+  const retriedStep2 = await collect(adapter.stream({ ...base, sessionId: 'S11d', tools: [bash], messages: step2Messages }))
+  assert.equal(finishOf(retriedStep2).reason.kind, 'stop')
+  assert.equal(textOf(retriedStep2), 'after-tool retry ok')
+})
+
+test('agy high-traffic text warnings fail as RATE_LIMIT and fail over to a healthy account without leaking text', async () => {
+  const rootA = mkdtempSync(join(tmpdir(), 'agy-traffic-a-'))
+  const rootB = mkdtempSync(join(tmpdir(), 'agy-traffic-b-'))
+  const homeA = join(rootA, 'home')
+  const { adapter, runtime } = makeRuntime({
+    config: {
+      accounts: [
+        { id: 'a', displayName: 'A', home: rootA, enabled: true, env: {}, contextWindow: 0, system: false, visibleModels: [], priority: 1, weight: 1 },
+        { id: 'b', displayName: 'B', home: rootB, enabled: true, env: {}, contextWindow: 0, system: false, visibleModels: [], priority: 2, weight: 1 },
+      ],
+    },
+    host: {
+      spawnAcp: (argv, cwd, env) => {
+        const childEnv = { ...process.env, ...env }
+        if (env?.HOME === homeA) {
+          childEnv.FAKE_AGY_PLAN = JSON.stringify([
+            { chunks: ['\n⚠ Our servers are experiencing high traffic right now, please try again in a minute.\n'] },
+          ])
+        }
+        const child = spawn(process.execPath, [argv[0], ...argv.slice(1)], { cwd, env: childEnv, stdio: ['pipe', 'pipe', 'pipe'] })
+        let stderr = ''
+        child.stderr.on('data', d => { stderr += d })
+        return {
+          stdin: child.stdin,
+          stdout: child.stdout,
+          exited: new Promise(resolve => child.on('exit', (code, signal) => resolve({ code, signal }))),
+          terminate: () => child.kill(),
+          stderrTail: () => stderr,
+        }
+      },
+    },
+  })
+
+  const chunks = await collect(adapter.stream({
+    provider: 'antigravity',
+    model: 'gemini-3.8-flash',
+    sessionId: 'S11e',
+    messages: [sys, user('u1', 'hello failover')],
+  }))
+  assert.equal(finishOf(chunks).reason.kind, 'stop')
+  assert.doesNotMatch(textOf(chunks), /high traffic/)
+  assert.match(textOf(chunks), /^echo:gemini-3\.8-flash:high:hello failover$/)
+  assert.equal(runtime.status().lastAccount, 'b')
+  assert.equal(runtime.status().accounts.find(row => row.id === 'a').cooldowns.length, 1)
+})
+
 test('cache reads stay disjoint from the uncached input count', () => {
   const usage = toTokenUsage({ inputTokens: 11_677, outputTokens: 321, cachedReadTokens: 31_377, cachedWriteTokens: 0, totalTokens: 43_375 })
   assert.deepEqual(usage, {
@@ -362,20 +512,31 @@ test('live configure updates context window, default effort, and long-decode con
   assert.equal(info.context.contextWindow, 900_000)
   assert.equal(info.reasoning.defaultEffort, 'low')
 })
-test('the ACP client identity is on the third-party-model allowlist', async () => {
-  const { adapter, inits } = makeRuntime()
+test('the ACP client identifies as the official Antigravity client with the agy semver', async () => {
+  const argvLog = join(mkdtempSync(join(tmpdir(), 'agy-argv-')), 'argv.jsonl')
+  const { adapter, inits } = makeRuntime({ env: { FAKE_AGY_ARGV: argvLog } })
   await collect(adapter.stream({ provider: 'antigravity', model: 'gemini-4-argon', sessionId: 'S13', messages: [sys, user('u1', 'hello')] }))
-  assert.equal(inits()[0].clientInfo.name, 'jetbrains.dsh')
+  assert.deepEqual(inits()[0].clientInfo, { name: 'antigravity', version: '0.0.1' })
+  const argv = JSON.parse(readFileSync(argvLog, 'utf8').trim().split('\n')[0])
+  const flag = argv.indexOf('--override_user_agent_name')
+  assert.ok(flag > 0, `agy acp argv carries the user-agent override: ${JSON.stringify(argv)}`)
+  assert.equal(argv[flag + 1], 'antigravity')
+  assert.equal(argv[0], 'acp')
 })
 
-test('hidden Sonnet and GPT-OSS still resolve but stay out of the picker', async () => {
+test('acpClientVersion keeps the agy semver and falls back to 1.5.5', () => {
+  assert.equal(acpClientVersion('Antigravity CLI 1.5.7'), '1.5.7')
+  assert.equal(acpClientVersion('v1.6.0-beta.2'), '1.6.0')
+  assert.equal(acpClientVersion('unknown'), '1.5.5')
+})
+
+test('every endpoint-advertised family including Sonnet and GPT-OSS appears in the picker and resolves cleanly', async () => {
   const { adapter } = makeRuntime()
   const listed = (await adapter.listModels('antigravity')).map(m => m.id)
-  assert.deepEqual(listed, ['gemini-4-argon', 'gemini-3.8-flash', 'claude-opus-5-5'])
+  assert.deepEqual(listed, ['gemini-4-carbon', 'gemini-4-argon', 'gemini-3.8-flash', 'claude-opus-5-5', 'claude-sonnet-5-5', 'gpt-oss-120b-medium'])
   const claude = await adapter.resolveModel('antigravity', 'claude-opus-5-5')
   assert.deepEqual(claude.reasoning.efforts.map(e => e.id), ['low', 'medium', 'high'])
   assert.equal(claude.context.contextWindow, 256_000)
-  // A persisted selection keeps working even after the family is hidden.
   const sonnet = await adapter.resolveModel('antigravity', 'claude-sonnet-5-5')
   assert.deepEqual(sonnet.reasoning.efforts.map(e => e.id), ['low', 'medium', 'high'])
   const gpt = await adapter.resolveModel('antigravity', 'gpt-oss-120b-medium')
@@ -397,7 +558,7 @@ test('a live session folds availableModels into per-family efforts', async () =>
   const claude = await adapter.resolveModel('antigravity', 'claude-opus-5-5')
   assert.deepEqual(claude.reasoning.efforts.map(e => e.id), ['low', 'medium', 'high'])
   const listed = (await adapter.listModels('antigravity')).map(m => m.id)
-  assert.deepEqual(listed, ['gemini-4-argon', 'gemini-3.8-flash', 'claude-opus-5-5'])
+  assert.deepEqual(listed, ['gemini-4-argon', 'gemini-3.8-flash', 'claude-opus-5-5', 'claude-sonnet-5-5', 'gpt-oss-120b-medium'])
 })
 
 test('a hidden fixed-effort family still runs at medium without a thought_level write', async () => {
@@ -481,6 +642,123 @@ test('permission gate rejects spoofed native tools and grants genuinely reported
   // once — never as allow_always.
   const probe = await collect(adapter.stream({ ...base, messages: [sys, user('u1', 'PROBECALL')] }))
   assert.match(textOf(probe), /PROBE_OK:allow-once/)
+})
+
+test('permission gate accepts agy 1.5.8 name-only MCP calls while rejecting unoffered, stale, and conflicting names', async () => {
+  const { adapter } = makeRuntime()
+  const base = { provider: 'antigravity', model: 'gemini-4-argon', sessionId: 'S25_158', tools: [bash, read] }
+
+  // End-to-end: agy >= 1.5.8 sends `name: "mcp_dsh_<tool>"` and `title: "Run mcp_dsh_<tool>"`
+  // with no mcpServerName / mcpToolName / _meta.
+  const step1 = await collect(adapter.stream({ ...base, messages: [sys, user('u1', 'NAMEONLYCALL bash {"command":"pwd"}')] }))
+  assert.equal(finishOf(step1).reason.kind, 'tool-calls')
+  const [call] = callsOf(step1)
+  assert.equal(call.name, 'bash')
+  const resumed = await collect(adapter.stream({ ...base, messages: [sys, user('u1', 'NAMEONLYCALL bash {"command":"pwd"}'), assistantFrom('a1', step1), tool('t1', call.id, '/workspace')] }))
+  assert.equal(finishOf(resumed).reason.kind, 'stop')
+  assert.equal(textOf(resumed), 'RESULT(bash)=/workspace')
+
+  const warnings = []
+  const options = [{ optionId: 'allow', kind: 'allow_once' }, { optionId: 'deny', kind: 'reject_once' }]
+  const makeState = (reportedToolCalls, overrides = {}) => ({
+    sessionId: 's1',
+    tenantKey: 't1',
+    turnLive: true,
+    engineMode: 'bridge',
+    reportedToolCalls,
+    advertisedToolNames: new Set(['bash']),
+    ...overrides,
+  })
+
+  // Unit: both bridge and native modes accept `name: "mcp_dsh_bash"` once reported in session/update.
+  for (const engineMode of ['bridge', 'native']) {
+    const reported = new Map()
+    assert.equal(recordReportedToolCall({ reportedToolCalls: reported }, {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'call_1',
+      name: 'mcp_dsh_bash',
+      kind: 'other',
+      title: 'Run mcp_dsh_bash',
+      rawInput: { command: 'pwd' },
+    }), 'created')
+    assert.equal(recordReportedToolCall({ reportedToolCalls: reported }, {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'call_1',
+      name: 'mcp_dsh_bash',
+      kind: 'other',
+      status: 'pending',
+    }), 'merged')
+    const outcome = answerPermission(makeState(reported, { engineMode }), {
+      sessionId: 's1',
+      toolCall: { toolCallId: 'call_1', name: 'mcp_dsh_bash', kind: 'other', title: 'Run mcp_dsh_bash', rawInput: { command: 'pwd' } },
+      options,
+    }, { hasHandshake: () => true, warn: m => warnings.push(m) })
+    assert.deepEqual(outcome, { outcome: 'selected', optionId: 'allow' })
+  }
+
+  // Built-in dsh_call_tool via agy 1.5.8 `name: "mcp_dsh_dsh_call_tool"` is also allowed.
+  {
+    const reported = new Map()
+    recordReportedToolCall({ reportedToolCalls: reported }, {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'call_meta',
+      name: 'mcp_dsh_dsh_call_tool',
+      kind: 'other',
+      title: 'Run mcp_dsh_dsh_call_tool',
+    })
+    const outcome = answerPermission(makeState(reported), {
+      sessionId: 's1',
+      toolCall: { toolCallId: 'call_meta', name: 'mcp_dsh_dsh_call_tool', kind: 'other', title: 'Run mcp_dsh_dsh_call_tool' },
+      options,
+    }, { hasHandshake: () => true, warn: m => warnings.push(m) })
+    assert.deepEqual(outcome, { outcome: 'selected', optionId: 'allow' })
+  }
+
+  // Unoffered tool, unreported (stale) call, or mismatched claim/explicit fields must still be refused.
+  {
+    const reported = new Map()
+    recordReportedToolCall({ reportedToolCalls: reported }, { sessionUpdate: 'tool_call', toolCallId: 'call_unoffered', name: 'mcp_dsh_write', kind: 'other' })
+    assert.deepEqual(answerPermission(makeState(reported), {
+      sessionId: 's1',
+      toolCall: { toolCallId: 'call_unoffered', name: 'mcp_dsh_write', kind: 'other' },
+      options,
+    }, { hasHandshake: () => true, warn: m => warnings.push(m) }), { outcome: 'selected', optionId: 'deny' })
+
+    assert.deepEqual(answerPermission(makeState(new Map()), {
+      sessionId: 's1',
+      toolCall: { toolCallId: 'call_stale', name: 'mcp_dsh_bash', kind: 'other' },
+      options,
+    }, { hasHandshake: () => true, warn: m => warnings.push(m) }), { outcome: 'selected', optionId: 'deny' })
+
+    const mismatch = new Map()
+    recordReportedToolCall({ reportedToolCalls: mismatch }, { sessionUpdate: 'tool_call', toolCallId: 'call_ok', name: 'mcp_dsh_bash', kind: 'other' })
+    assert.deepEqual(answerPermission(makeState(mismatch), {
+      sessionId: 's1',
+      toolCall: { toolCallId: 'call_ok', name: 'mcp_dsh_read_file', kind: 'other' },
+      options,
+    }, { hasHandshake: () => true, warn: m => warnings.push(m) }), { outcome: 'selected', optionId: 'deny' })
+
+    const selfConflict = new Map()
+    assert.equal(recordReportedToolCall({ reportedToolCalls: selfConflict }, {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'call_bad',
+      name: 'mcp_dsh_bash',
+      mcpToolName: 'read_file',
+      mcpServerName: 'dsh',
+    }), 'conflict')
+    assert.deepEqual(answerPermission(makeState(selfConflict), {
+      sessionId: 's1',
+      toolCall: { toolCallId: 'call_bad', name: 'mcp_dsh_bash' },
+      options,
+    }, { hasHandshake: () => true, warn: m => warnings.push(m) }), { outcome: 'selected', optionId: 'deny' })
+
+    // Identity-less probe must NOT match when a non-MCP `name` is present.
+    assert.deepEqual(answerPermission(makeState(new Map()), {
+      sessionId: 's1',
+      toolCall: { toolCallId: 'call_builtin_probe', name: 'bash', kind: 'other', rawInput: {} },
+      options,
+    }, { hasHandshake: () => true, warn: m => warnings.push(m) }), { outcome: 'selected', optionId: 'deny' })
+  }
 })
 
 test('the permission gate binds the loading probe to a handshake and keeps identities across updates', async () => {
@@ -893,4 +1171,531 @@ test('mixed SQLite step usage and final result.usage fallback subtracts already-
     totalTokens: 462,
   })
   assert.equal(u1.totalTokens + u2.totalTokens, 1050)
+})
+
+function encodeTimestamp(secFloat) {
+  const whole = Math.floor(secFloat)
+  const nanos = Math.round((secFloat - whole) * 1_000_000_000)
+  return [
+    ...encodeVarint((1n << 3n) | 0n), ...encodeVarint(whole),
+    ...encodeVarint((2n << 3n) | 0n), ...encodeVarint(nanos),
+  ]
+}
+
+function encodeDurationProto(secFloat) {
+  const whole = Math.floor(Math.max(0, secFloat))
+  const nanos = Math.round((Math.max(0, secFloat) - whole) * 1_000_000_000)
+  const out = []
+  if (whole > 0) out.push(...encodeVarint((1n << 3n) | 0n), ...encodeVarint(whole))
+  if (nanos > 0) out.push(...encodeVarint((2n << 3n) | 0n), ...encodeVarint(nanos))
+  return out
+}
+
+function writeRichModelStep(dbPath, idx, stats, genIdx, cwmEstTokens) {
+  mkdirSync(dirname(dbPath), { recursive: true })
+  const startSec = stats.startSec ?? 1_794_040_000
+  const firstSec = startSec + (stats.ttftSeconds ?? 10)
+  const endSec = firstSec + (stats.streamSeconds ?? 8)
+  const sub = [
+    ...encodeVarint((1n << 3n) | 0n), ...encodeVarint(1417),
+    ...encodeVarint((2n << 3n) | 0n), ...encodeVarint(stats.inputTokens ?? 0),
+    ...encodeVarint((3n << 3n) | 0n), ...encodeVarint(stats.outputTokens ?? 0),
+    ...encodeVarint((4n << 3n) | 0n), ...encodeVarint(stats.cachedWriteTokens ?? 0),
+    ...encodeVarint((5n << 3n) | 0n), ...encodeVarint(stats.cachedReadTokens ?? 0),
+    ...encodeVarint((9n << 3n) | 0n), ...encodeVarint(stats.thoughtTokens ?? 0),
+    ...encodeVarint((10n << 3n) | 0n), ...encodeVarint(stats.textOutTokens ?? 0),
+  ]
+  const top = new Uint8Array([
+    ...encodeLengthDelimited(1, encodeTimestamp(startSec)),
+    ...encodeLengthDelimited(6, encodeTimestamp(firstSec)),
+    ...encodeLengthDelimited(7, encodeTimestamp(endSec)),
+    ...encodeLengthDelimited(9, sub),
+  ])
+  const db = new DatabaseSync(dbPath)
+  try {
+    db.exec('CREATE TABLE IF NOT EXISTS steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, metadata BLOB)')
+    db.prepare('INSERT OR REPLACE INTO steps (idx, step_type, status, metadata) VALUES (?, 15, 3, ?)').run(idx, top)
+    if (genIdx !== undefined) {
+      db.exec('CREATE TABLE IF NOT EXISTS gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER NOT NULL DEFAULT 0)')
+      const chat = [
+        ...encodeVarint((3n << 3n) | 0n), ...encodeVarint(1417),
+        ...encodeLengthDelimited(4, sub),
+        ...(cwmEstTokens !== undefined
+          ? encodeLengthDelimited(9, encodeLengthDelimited(10, [...encodeVarint((1n << 3n) | 0n), ...encodeVarint(cwmEstTokens)]))
+          : []),
+        ...encodeLengthDelimited(11, encodeDurationProto(stats.ttftSeconds ?? 10)),
+        ...encodeLengthDelimited(12, encodeDurationProto(stats.streamSeconds ?? 8)),
+      ]
+      const genBlob = new Uint8Array(encodeLengthDelimited(1, chat))
+      db.prepare('INSERT OR REPLACE INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)').run(genIdx, genBlob, genBlob.length)
+    }
+  } finally {
+    db.close()
+  }
+}
+
+test('prepareHome pre-seeds Gemini 4 Argon (High) in settings.json without overwriting an explicit choice', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-preflight-'))
+  prepareHome(dir)
+  const settingsPath = join(dir, 'agy', 'settings.json')
+  const seeded = JSON.parse(readFileSync(settingsPath, 'utf8'))
+  assert.equal(seeded.model, 'Gemini 4 Argon (High)')
+  assert.equal(seeded.contextWindow, '512K')
+  assert.equal(seeded.toolPermission, 'request-review')
+
+  const cliSettingsPath = join(dir, 'antigravity-cli', 'settings.json')
+  const cliSeeded = JSON.parse(readFileSync(cliSettingsPath, 'utf8'))
+  assert.equal(cliSeeded.model, 'Gemini 4 Argon (High)')
+  assert.equal(cliSeeded.contextWindow, '512K')
+
+  const { writeFileSync } = requireSqlite('node:fs')
+  // Legacy Medium default is upgraded to High.
+  const mediumDir = mkdtempSync(join(tmpdir(), 'agy-preflight-medium-'))
+  mkdirSync(join(mediumDir, 'agy'), { recursive: true })
+  const mediumSettings = join(mediumDir, 'agy', 'settings.json')
+  writeFileSync(mediumSettings, JSON.stringify({ model: 'Gemini 4 Argon (Medium)' }))
+  prepareHome(mediumDir)
+  assert.equal(JSON.parse(readFileSync(mediumSettings, 'utf8')).model, 'Gemini 4 Argon (High)')
+
+  // Explicit model and useG1Credits already present on disk are preserved.
+  const customDir = mkdtempSync(join(tmpdir(), 'agy-preflight-custom-'))
+  mkdirSync(join(customDir, 'agy'), { recursive: true })
+  mkdirSync(join(customDir, 'antigravity-cli'), { recursive: true })
+  const customSettings = join(customDir, 'agy', 'settings.json')
+  const customCliSettings = join(customDir, 'antigravity-cli', 'settings.json')
+  writeFileSync(customSettings, JSON.stringify({ model: 'Claude Opus 5.5' }))
+  writeFileSync(customCliSettings, JSON.stringify({ useG1Credits: true }))
+  prepareHome(customDir)
+  assert.equal(JSON.parse(readFileSync(customSettings, 'utf8')).model, 'Claude Opus 5.5')
+  assert.equal(JSON.parse(readFileSync(customCliSettings, 'utf8')).useG1Credits, true)
+})
+
+test('prepareHome seeds the default CLI project and completed onboarding without clobbering agy-owned state', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-preflight-seed-'))
+  prepareHome(dir)
+  const projectPath = join(dir, 'config', 'projects', 'default-cli-project.json')
+  assert.deepEqual(JSON.parse(readFileSync(projectPath, 'utf8')), { id: 'default-cli-project', name: 'CLI Project', projectResources: {} })
+  const expectedOnboarding = '{"consumerOnboardingComplete":true,"enterpriseOnboardingComplete":false,"onboardingComplete":true}\n'
+  for (const appData of ['agy', 'antigravity-cli']) {
+    assert.equal(readFileSync(join(dir, appData, 'cache', 'onboarding.json'), 'utf8'), expectedOnboarding, `${appData} onboarding`)
+  }
+
+  // agy owns projectResources once it writes them; a valid record is kept as is.
+  const owned = { id: 'default-cli-project', name: 'CLI Project', projectResources: { repo: { path: '/w' } } }
+  writeFileSync(projectPath, JSON.stringify(owned))
+  // A pretty-printed incomplete onboarding written by agy is completed in place, extra keys kept.
+  const cliOnboarding = join(dir, 'antigravity-cli', 'cache', 'onboarding.json')
+  writeFileSync(cliOnboarding, JSON.stringify({ consumerOnboardingComplete: false, enterpriseOnboardingComplete: true, onboardingComplete: false, seenAt: 7 }, null, 2))
+  prepareHome(dir)
+  assert.deepEqual(JSON.parse(readFileSync(projectPath, 'utf8')), owned)
+  assert.deepEqual(JSON.parse(readFileSync(cliOnboarding, 'utf8')), { consumerOnboardingComplete: true, enterpriseOnboardingComplete: true, onboardingComplete: true, seenAt: 7 })
+
+  // A corrupt project record is replaced.
+  writeFileSync(projectPath, '{not json')
+  prepareHome(dir)
+  assert.equal(JSON.parse(readFileSync(projectPath, 'utf8')).id, 'default-cli-project')
+})
+
+test('evaluateDegradeFingerprint decodes real-time gen_metadata billing and catches 128K truncation without compaction false positives', () => {
+  const tmpDb = join(mkdtempSync(join(tmpdir(), 'agy-fp-')), 'conv.db')
+  writeRichModelStep(tmpDb, 0, {
+    inputTokens: 3508, cachedReadTokens: 20480, outputTokens: 1183, thoughtTokens: 581, textOutTokens: 602,
+    ttftSeconds: 2.33, streamSeconds: 0.42,
+  }, 0, 29412)
+  const db = new DatabaseSync(tmpDb, { readOnly: true })
+  const stepRow = db.prepare('SELECT metadata FROM steps WHERE idx = 0').get()
+  const genRow = db.prepare('SELECT data FROM gen_metadata WHERE idx = 0').get()
+  db.close()
+
+  const decoded = decodeStepMetadata(new Uint8Array(stepRow.metadata.buffer, stepRow.metadata.byteOffset, stepRow.metadata.byteLength))
+  assert.equal(decoded.textOutTokens, 602)
+  assert.ok(Math.abs(decoded.ttftSeconds - 2.33) < 0.01)
+  assert.ok(Math.abs(decoded.streamSeconds - 0.42) < 0.01)
+
+  const genDecoded = decodeGenMetadata(new Uint8Array(genRow.data.buffer, genRow.data.byteOffset, genRow.data.byteLength))
+  assert.ok(genDecoded)
+  assert.equal(genDecoded.cwmEstTokens, 29412)
+  assert.equal(genDecoded.cachedReadTokens, 20480)
+  assert.ok(Math.abs(genDecoded.streamSeconds - 0.42) < 0.01, 'sub-1s Duration with omitted seconds=0 decodes nanos accurately')
+
+  // 1. Single borderline signals stay < 3 (no false positive).
+  const singleFastTtft = evaluateDegradeFingerprint({
+    model: 'gemini-4-argon',
+    effort: 'high',
+    step: { inputTokens: 4000, cachedReadTokens: 25159, outputTokens: 500, thoughtTokens: 500, textOutTokens: 300, ttftSeconds: 3.9, streamSeconds: 3.5, wallSeconds: 7.4 },
+  })
+  assert.equal(singleFastTtft.score, 1)
+  assert.equal(singleFastTtft.degraded, false)
+
+  const singleAlignedBlock = evaluateDegradeFingerprint({
+    model: 'gemini-4-argon',
+    effort: 'high',
+    step: { inputTokens: 2000, cachedReadTokens: 20480, outputTokens: 300, thoughtTokens: 1200, textOutTokens: 200, ttftSeconds: 11.0, streamSeconds: 2.5, wallSeconds: 13.5 },
+  })
+  assert.equal(singleAlignedBlock.score, 2)
+  assert.equal(singleAlignedBlock.degraded, false)
+
+  // 2. Hard 128K head-slice truncation (`127,997` cap on fallback pool) scores >= 5 immediately.
+  const truncated = evaluateDegradeFingerprint({
+    model: 'gemini-4-argon',
+    effort: 'high',
+    cwmEstTokens: 378_421,
+    step: { inputTokens: 3069, cachedReadTokens: 124928, outputTokens: 90, thoughtTokens: 15, textOutTokens: 75, ttftSeconds: 3.1, streamSeconds: 0.4, wallSeconds: 3.5 },
+  })
+  assert.equal(truncated.degraded, true)
+  assert.ok(truncated.signals.some(s => s.kind === 'context_truncated'))
+
+  // 3. Legitimate client-side trajectory compaction (cwmEstTokens also drops) is NOT flagged as cache_cliff,
+  //    whereas upstream thoughtSignature stripping without compaction IS flagged (+4).
+  const compacted = evaluateDegradeFingerprint({
+    model: 'gemini-4-argon',
+    effort: 'high',
+    cwmEstTokens: 35_573,
+    prevCacheRead: 265_000,
+    prevTotalInput: 269_406,
+    step: { inputTokens: 25_700, cachedReadTokens: 0, outputTokens: 447, thoughtTokens: 165, textOutTokens: 282, ttftSeconds: 5.39, streamSeconds: 4.1, wallSeconds: 9.49 },
+  })
+  assert.equal(compacted.degraded, false)
+
+  const cliff = evaluateDegradeFingerprint({
+    model: 'gemini-4-argon',
+    effort: 'high',
+    cwmEstTokens: 126_000,
+    prevCacheRead: 112_126,
+    prevTotalInput: 114_532,
+    step: { inputTokens: 93_797, cachedReadTokens: 0, outputTokens: 150, thoughtTokens: 40, textOutTokens: 110, ttftSeconds: 4.6, streamSeconds: 0.6, wallSeconds: 5.2 },
+  })
+  assert.equal(cliff.degraded, true)
+  assert.equal(cliff.signals[0].kind, 'cache_cliff')
+
+  // 4. Non-Argon models are never flagged.
+  const flash = evaluateDegradeFingerprint({
+    model: 'gemini-3.8-flash',
+    effort: 'high',
+    step: genDecoded,
+  })
+  assert.equal(flash.evaluated, false)
+  assert.equal(flash.degraded, false)
+})
+
+test('session-index.json resumes ACP sessions via native session/load across capacity eviction and full runtime restart', async () => {
+  const first = makeRuntime({ config: { maxLiveSessions: 1 } })
+  const baseA = { provider: 'antigravity', model: 'gemini-4-argon', sessionId: 'S-persist-A', tools: [bash] }
+  const baseB = { provider: 'antigravity', model: 'gemini-4-argon', sessionId: 'S-persist-B', tools: [bash] }
+
+  const a1 = await collect(first.adapter.stream({ ...baseA, messages: [sys, user('au1', 'turn one')] }))
+  const sessionA = first.prompts()[0].session
+  let histA = [sys, user('au1', 'turn one'), assistantFrom('aa1', a1)]
+
+  // Opening S-persist-B under maxLiveSessions=1 evicts S-persist-A from memory while persisting it.
+  await collect(first.adapter.stream({ ...baseB, messages: [sys, user('bu1', 'other session')] }))
+
+  // Turn 2 on S-persist-A resumes `sessionA` via `session/load` with NO <dsh_history> replay!
+  histA = [...histA, user('au2', 'turn two after eviction')]
+  const a2 = await collect(first.adapter.stream({ ...baseA, messages: histA }))
+  assert.equal(first.prompts().at(-1).session, sessionA, 'evicted session resumes original ACP sessionId via session/load')
+  assert.doesNotMatch(first.prompts().at(-1).text, /<dsh_history>/)
+  assert.ok(first.mcps().some(m => m.op === 'load' && m.session === sessionA))
+  histA = [...histA, assistantFrom('aa2', a2)]
+
+  // Full provider restart on the same `home` directory also resumes `sessionA` via `session/load`!
+  await first.runtime.dispose()
+  const log2 = join(first.home, 'prompts2.jsonl')
+  const mcp2 = join(first.home, 'mcp2.jsonl')
+  const restarted = new AntigravityRuntime({
+    config: {
+      provider: 'antigravity', displayName: 'Antigravity', command: fake, home: first.home,
+      accounts: [{ id: 'default', displayName: '', home: '', enabled: true, env: {}, contextWindow: 0, system: true, visibleModels: [], priority: 1, weight: 1 }],
+      contextWindow: 0, defaultEffort: 'high', autoPatch: false, patchScript: join(first.home, 'missing.py'),
+      maxLiveSessions: 16, idleSessionTtlMs: 600_000, parkSettleMs: 80, keepAliveMs: 1_000,
+      longDecodeContinuations: 3, warmup: false, quotaTtlMs: 60_000,
+    },
+    spawnAcp: (argv, cwd) => {
+      const child = spawn(process.execPath, [argv[0], ...argv.slice(1)], { cwd, env: { ...process.env, FAKE_AGY_LOG: log2, FAKE_AGY_MCP: mcp2 }, stdio: ['pipe', 'pipe', 'pipe'] })
+      return {
+        stdin: child.stdin,
+        stdout: child.stdout,
+        exited: new Promise(resolve => child.on('exit', (code, signal) => resolve({ code, signal }))),
+        terminate: () => child.kill(),
+        stderrTail: () => '',
+      }
+    },
+    runCommand: async (argv) => ({ code: 0, stdout: argv.includes('--version') ? 'fake-agy 0.0.1' : '{}', stderr: '' }),
+    readImage: async () => undefined,
+    canReadImages: () => false,
+    log: { info: () => undefined, warn: () => undefined },
+    onModelsChanged: () => undefined,
+  })
+  runtimes.push(restarted)
+  const adapter2 = new AntigravityAdapter(restarted, 'Antigravity', () => false)
+  histA = [...histA, user('au3', 'turn three after restart')]
+  await collect(adapter2.stream({ ...baseA, messages: histA }))
+  const prompts2 = readFileSync(log2, 'utf8').trim().split('\n').map(l => JSON.parse(l))
+  const mcps2 = readFileSync(mcp2, 'utf8').trim().split('\n').map(l => JSON.parse(l))
+  assert.equal(prompts2[0].session, sessionA, 'restarted runtime resumes original ACP sessionId via session/load')
+  assert.doesNotMatch(prompts2[0].text, /<dsh_history>/)
+  assert.ok(mcps2.some(m => m.op === 'load' && m.session === sessionA))
+
+  // Compaction (pruned message prefix) invalidates the persisted session and rebuilds cleanly.
+  const compactedHist = [
+    sys,
+    user('summary-1', 'Compacted summary'),
+    assistant('sum-a1', [{ type: 'text', text: 'Acknowledged.' }]),
+    user('au4', 'after compaction'),
+  ]
+  await collect(adapter2.stream({ ...baseA, messages: compactedHist }))
+  const promptsAfterCompact = readFileSync(log2, 'utf8').trim().split('\n').map(l => JSON.parse(l))
+  assert.notEqual(promptsAfterCompact.at(-1).session, sessionA)
+  assert.match(promptsAfterCompact.at(-1).text, /<dsh_history>/)
+})
+
+test('prompt hierarchy lifts AGENTS.md into <user_rules>, preserves oversized tool contracts, orders human input last, and supports toolUpdate in-history', async () => {
+  const { adapter, prompts } = makeRuntime()
+  const resolved = await adapter.resolveModel('antigravity', 'gemini-4-argon')
+  assert.equal(resolved.toolUpdate, 'in-history')
+
+  const oversizedSubagent = {
+    name: 'subagent',
+    description: `${'Delegate isolated multi-step research or coding work to a dedicated subagent. '.repeat(22)}CRITICAL_DELEGATION_RULE: never poll in a loop after spawning.`,
+    parameters: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', description: 'Complete self-contained task specification for the subagent.' },
+      },
+      required: ['prompt'],
+    },
+  }
+  const deferredExtra = {
+    name: 'inspect_metrics',
+    description: 'Inspect live telemetry counters',
+    deferLoading: true,
+    parameters: { type: 'object', properties: { metric: { type: 'string' } }, required: ['metric'] },
+  }
+  const agentsMd = {
+    id: 'inst-1',
+    role: 'user',
+    source: { kind: 'agent-instructions' },
+    content: [{ type: 'text', text: '<system-reminder>\nMANDATORY_REPO_RULE: preserve trailing newlines.\n</system-reminder>' }],
+  }
+  const skillCatalog = {
+    id: 'skills-1',
+    role: 'user',
+    source: { kind: 'skill-catalog' },
+    content: [{ type: 'text', text: '<system-reminder>Available skills: dsh-code-review</system-reminder>' }],
+  }
+  const humanMsg = user('hu-1', 'Please review runtime.ts')
+
+  // Even when humanMsg precedes skillCatalog in DSH's event array, inputPrompt places background context first and humanMsg last, separated by \n\n.
+  const turn1 = await collect(adapter.stream({
+    provider: 'antigravity',
+    model: 'gemini-4-argon',
+    sessionId: 'S-hierarchy',
+    tools: [oversizedSubagent, deferredExtra],
+    messages: [sys, agentsMd, humanMsg, skillCatalog],
+  }))
+  assert.equal(finishOf(turn1).reason.kind, 'stop')
+
+  const p1 = prompts()[0]
+  const plainSystem = p1.system.replaceAll('\u200b', '')
+  assert.match(plainSystem, /<user_rules>\nMANDATORY_REPO_RULE: preserve trailing newlines\.\n<\/user_rules>/)
+  assert.match(plainSystem, /<harness_tool_contracts>[\s\S]*CRITICAL_DELEGATION_RULE: never poll in a loop after spawning\./)
+  assert.doesNotMatch(p1.text, /MANDATORY_REPO_RULE/, 'lifted initial agent-instructions are not duplicated in user input')
+  assert.equal(p1.text, '<system-reminder>Available skills: dsh-code-review</system-reminder>\n\nPlease review runtime.ts')
+
+  // Turn 2: activating a deferred tool via developer `tool-addition` (in-history) keeps the exact ACP session alive!
+  const devAdd = {
+    id: 'dev-add-1',
+    role: 'developer',
+    content: [{ type: 'tool-addition', toolName: 'inspect_metrics' }],
+    source: { kind: 'tool-registry' },
+  }
+  const turn2Prompt = 'CALL dsh_call_tool {"name":"inspect_metrics","arguments":{"metric":"qps"}}'
+  const hist2 = [sys, agentsMd, humanMsg, skillCatalog, assistantFrom('ha1', turn1), devAdd, user('hu-2', turn2Prompt)]
+  const turn2 = await collect(adapter.stream({
+    provider: 'antigravity',
+    model: 'gemini-4-argon',
+    sessionId: 'S-hierarchy',
+    tools: [oversizedSubagent, deferredExtra],
+    messages: hist2,
+  }))
+  assert.equal(finishOf(turn2).reason.kind, 'tool-calls')
+  assert.equal(prompts()[1].session, p1.session, 'in-history tool-addition keeps the live ACP session intact')
+  const [call] = callsOf(turn2)
+  assert.equal(call.name, 'inspect_metrics')
+})
+
+/** One account as a live configure request spells it. */
+const runtimeAccount = (id, extra = {}) => ({
+  id, displayName: '', home: '', enabled: true, env: {}, contextWindow: 0,
+  visibleModels: [], priority: 1, weight: 1, ...extra,
+})
+
+test('live configure keeps the machine account row and its system flag', () => {
+  const { runtime } = makeRuntime()
+  const status = runtime.configure({
+    accounts: [runtimeAccount('default', { system: true, displayName: '本机' }), runtimeAccount('work', { displayName: 'Work' })],
+  })
+  assert.deepEqual(status.accounts.map(row => [row.id, row.system]), [['default', true], ['work', false]])
+  assert.equal(status.accounts[0].label, '本机', 'the machine remark survives the round trip')
+  // The list is the only truth: a save without the machine entry removes it.
+  const removed = runtime.configure({ accounts: [runtimeAccount('work', { displayName: 'Work' })] })
+  assert.deepEqual(removed.accounts.map(row => row.id), ['work'])
+})
+
+test('the context window is a global default narrowed by every account that can serve the model', () => {
+  const { runtime } = makeRuntime({ config: { contextWindow: 900_000 } })
+  const windows = () => runtime.contextWindowFor('gpt-oss-120b-medium')
+  assert.equal(windows(), 900_000, 'the global default applies while every account follows it')
+  runtime.configure({ accounts: [runtimeAccount('default', { system: true, contextWindow: 512_000 })] })
+  assert.equal(windows(), 512_000)
+  runtime.configure({ accounts: [runtimeAccount('default', { system: true, contextWindow: 1_048_576 })] })
+  assert.equal(windows(), 900_000, 'an account can narrow the global window, never widen it')
+  runtime.configure({ contextWindow: 0, accounts: [runtimeAccount('default', { system: true })] })
+  assert.equal(windows(), 131_072, 'with no global override GPT-OSS keeps its own window')
+  runtime.configure({ accounts: [runtimeAccount('default', { system: true, contextWindow: 100_000 })] })
+  assert.equal(windows(), 100_000)
+  runtime.configure({
+    contextWindow: 900_000,
+    accounts: [runtimeAccount('default', { system: true, contextWindow: 512_000, visibleModels: ['claude-opus-5-5'] })],
+  })
+  assert.equal(runtime.servesModel('default', 'gpt-oss-120b-medium'), false, 'an account visibleModels list still narrows on its own')
+  assert.equal(windows(), 900_000, 'an account that cannot serve the model never narrows its window')
+})
+
+test('Windows preflight locates agy.exe in LOCALAPPDATA and PATH while skipping IDE shims and WindowsApps stubs', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'agy-win-preflight-'))
+  const ideBin = join(root, 'Programs', 'Antigravity', 'bin')
+  const pathBin = join(root, 'custom-bin')
+  const localAppData = join(root, 'AppData', 'Local')
+  mkdirSync(ideBin, { recursive: true })
+  mkdirSync(pathBin, { recursive: true })
+  // Extensionless IDE shell shim and .cmd wrapper must not match on win32.
+  writeFileSync(join(ideBin, 'agy'), '#!/bin/sh\n')
+  writeFileSync(join(ideBin, 'agy.cmd'), '@echo off\r\n')
+  const pathAgyExe = join(pathBin, 'agy.exe')
+  writeFileSync(pathAgyExe, 'MZ')
+
+  assert.equal(
+    resolveAgyBinary('', {
+      platform: 'win32',
+      home: root,
+      env: { LOCALAPPDATA: localAppData, Path: `${ideBin};"${pathBin}"` },
+    }),
+    pathAgyExe,
+  )
+
+  const defaultWinExe = join(localAppData, 'agy', 'bin', 'agy.exe')
+  mkdirSync(dirname(defaultWinExe), { recursive: true })
+  writeFileSync(defaultWinExe, 'MZ')
+  assert.equal(
+    resolveAgyBinary('', {
+      platform: 'win32',
+      home: root,
+      env: { LOCALAPPDATA: localAppData, PATH: `${ideBin};${pathBin}` },
+    }),
+    defaultWinExe,
+  )
+
+  // Python lookup skips zero-byte Microsoft\WindowsApps stubs and picks real python.exe, or falls back to py.exe -3.
+  const winApps = join(localAppData, 'Microsoft', 'WindowsApps')
+  const condaDir = join(root, 'Python311')
+  const sysRoot = join(root, 'Windows')
+  mkdirSync(winApps, { recursive: true })
+  mkdirSync(condaDir, { recursive: true })
+  mkdirSync(sysRoot, { recursive: true })
+  writeFileSync(join(winApps, 'python.exe'), '')
+  writeFileSync(join(winApps, 'python3.exe'), '')
+  writeFileSync(join(sysRoot, 'py.exe'), 'MZ-py')
+
+  assert.deepEqual(
+    resolvePythonArgv({
+      platform: 'win32',
+      home: root,
+      env: { PATH: winApps, SystemRoot: sysRoot },
+    }),
+    [join(sysRoot, 'py.exe'), '-3'],
+  )
+
+  const realPy = join(condaDir, 'python.exe')
+  writeFileSync(realPy, 'MZ-python')
+  assert.deepEqual(
+    resolvePythonArgv({
+      platform: 'win32',
+      home: root,
+      env: { PATH: `${winApps};${condaDir}`, SystemRoot: sysRoot },
+    }),
+    [realPy],
+  )
+
+  const script = join(root, 'agy-patch.py')
+  writeFileSync(script, '# stub\n')
+  const calls = []
+  const unlock = await checkUnlock(
+    defaultWinExe,
+    script,
+    true,
+    async (argv) => {
+      calls.push(argv)
+      return { code: 0, stdout: '[=] all gates already unlocked; nothing to write\n', stderr: '' }
+    },
+    { platform: 'win32', home: root, env: { PATH: `${winApps};${condaDir}`, SystemRoot: sysRoot } },
+  )
+  assert.equal(unlock.status, 'unlocked')
+  assert.equal(calls[0][0], realPy)
+
+  assert.throws(() => assertSupportedAgyVersion('1.2.7', defaultWinExe), /1\.2\.7.*agy update/)
+  assert.doesNotThrow(() => assertSupportedAgyVersion('1.5.2', defaultWinExe))
+  assert.doesNotThrow(() => assertSupportedAgyVersion('Antigravity CLI 1.5.2', defaultWinExe))
+  assert.doesNotThrow(() => assertSupportedAgyVersion('fake-agy 0.0.1', defaultWinExe))
+
+  // File-backed OAuth token sync seeds isolated home and updates only when source is newer.
+  const cliAuthDir = join(root, '.gemini', 'antigravity-cli')
+  const isolatedHome = join(root, '.dsh', 'cache', 'antigravity-acp')
+  mkdirSync(cliAuthDir, { recursive: true })
+  const srcToken = join(cliAuthDir, 'antigravity-oauth-token')
+  const dstToken = join(isolatedHome, 'agy', 'antigravity-oauth-token')
+  writeFileSync(srcToken, 'token-v1')
+  utimesSync(srcToken, 1_700_000_100, 1_700_000_100)
+  prepareHome(isolatedHome, root)
+  assert.equal(readFileSync(dstToken, 'utf8'), 'token-v1')
+
+  // Newer refreshed token in isolated home is preserved over older CLI token.
+  writeFileSync(dstToken, 'token-refreshed')
+  utimesSync(dstToken, 1_700_000_200, 1_700_000_200)
+  syncOAuthToken(isolatedHome, root)
+  assert.equal(readFileSync(dstToken, 'utf8'), 'token-refreshed')
+
+  // Fresh terminal `agy` sign-in updates isolated home when source mtime advances.
+  writeFileSync(srcToken, 'token-v3')
+  utimesSync(srcToken, 1_700_000_300, 1_700_000_300)
+  syncOAuthToken(isolatedHome, root)
+  assert.equal(readFileSync(dstToken, 'utf8'), 'token-v3')
+})
+
+test('multi-turn tool calls mint distinct session-wide ToolCallIds so PTC subCallIds (<id>:ptc:1) never repeat across turns', async () => {
+  const { adapter } = makeRuntime()
+  const base = { provider: 'antigravity', model: 'gemini-4-argon', sessionId: 'S-ptc-unique', tools: [bash] }
+  let history = [sys]
+  const seenCallIds = new Set()
+  const seenPtcSubCallIds = new Set()
+
+  for (let turnIdx = 1; turnIdx <= 3; turnIdx++) {
+    history = [...history, user(`u${turnIdx}`, `CALL bash {"command":"echo turn-${turnIdx}"}`)]
+    const step1 = await collect(adapter.stream({ ...base, messages: history }))
+    assert.equal(finishOf(step1).reason.kind, 'tool-calls')
+    const [call] = callsOf(step1)
+    assert.match(call.id, /^agy_[0-9a-f]{12}_1$/, 'ToolCallId uses [a-z0-9_] only for cross-provider safety')
+    assert.equal(seenCallIds.has(call.id), false, `turn ${turnIdx} repeated ToolCallId ${call.id}`)
+    seenCallIds.add(call.id)
+    const ptcSubId = `${call.id}:ptc:1`
+    assert.equal(seenPtcSubCallIds.has(ptcSubId), false, `turn ${turnIdx} repeated PTC subCallId ${ptcSubId}`)
+    seenPtcSubCallIds.add(ptcSubId)
+
+    history = [...history, assistantFrom(`a${turnIdx}-1`, step1), tool(`t${turnIdx}`, call.id, `out-${turnIdx}`)]
+    const step2 = await collect(adapter.stream({ ...base, messages: history }))
+    assert.equal(finishOf(step2).reason.kind, 'stop')
+    history = [...history, assistantFrom(`a${turnIdx}-2`, step2)]
+  }
+  assert.equal(seenCallIds.size, 3)
+  assert.equal(seenPtcSubCallIds.size, 3)
 })

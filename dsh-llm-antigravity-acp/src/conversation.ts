@@ -15,22 +15,64 @@ import { LlmError, ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import type { AcpPromptResult, AcpSessionUpdate } from './acp-process.ts'
 import type { BridgeTool, BridgeToolResult } from './mcp-bridge.ts'
-import { AGENT_TOOL_PREFIX, CALL_TOOL_NAME } from './history.ts'
-import type { StepUsageBatch } from './usage-db.ts'
+import { AGENT_TOOL_PREFIX, CALL_TOOL_NAME, type NativeSandboxMode } from './history.ts'
+import { labeled } from './labels.ts'
+import type { StepUsageBatch, StepUsageSample } from './usage-db.ts'
 import { AsyncQueue, deferred, type Deferred } from './util.ts'
 
 export { CALL_TOOL_NAME }
 
 /** Agent-side transport retry notice streamed as message text, e.g. `⚠ API error (attempt 1): …`. */
-const AGENT_RETRY_NOTICE = /^\s*⚠\s*API error \(attempt \d+\)/
+const AGENT_RETRY_NOTICE = /^\s*⚠\s*(?:Error:\s*)?API error \(attempt \d+\)/i
+/** Prefix of `AGENT_RETRY_NOTICE` while its opening words arrive across chunks. */
+const AGENT_RETRY_PREFIX = /^\s*⚠\s*(?:e(?:r(?:r(?:o(?:r:?)?)?)?)?\s*)?(?:a(?:p(?:i(?:\s+e(?:r(?:r(?:o(?:r(?:\s*\((?:a(?:t(?:t(?:e(?:m(?:p(?:t(?:\s*\d*)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?$/i
+/** Lone warning prefix (`⚠` or `⚠ Error:`) before the notice body arrives. */
+const WARNING_PREFIX = /^\s*⚠(?:\s*e(?:r(?:r(?:o(?:r:?)?)?)?)?)?\s*$/i
 /** First sentence of the notice agy inserts when one generation hits its own output cap. */
 const OUTPUT_LIMIT_HEAD = 'your previous response was cut off because it exceeded the output token limit'
 /** Second sentence of that same notice. */
 const OUTPUT_LIMIT_TAIL = 'please continue from where you left off, keeping your response shorter'
+/** Terminal step error agy streams as message text when upstream connection attempts fail. */
+const NETWORK_ISSUE_MESSAGE = 'There was a network issue connecting to the server, please try again.'
+const NETWORK_ISSUE_HEAD = 'there was a network issue connecting to the server, please try again'
+/** Terminal step error agy streams as message text when upstream rejects the turn for high traffic. */
+const HIGH_TRAFFIC_MESSAGE = 'Our servers are experiencing high traffic right now, please try again in a minute.'
+const HIGH_TRAFFIC_HEAD = 'our servers are experiencing high traffic right now, please try again in a minute'
+
+/** Classification of a buffered `agent_message_chunk` sequence against agy's status notices. */
+export type AgentNoticeVerdict =
+  | { kind: 'emit' }
+  | { kind: 'hold' }
+  | { kind: 'drop' }
+  | { kind: 'error'; code: 'TRANSPORT' | 'RATE_LIMIT'; message: string }
 
 /** Collapse agy's warning mark and line breaks so the notice can be recognized across chunks. */
 function noticeText(raw: string): string {
   return raw.replace(/⚠/g, ' ').replace(/\bError:/gi, ' ').replace(/\s+/g, ' ').trim().toLowerCase()
+}
+
+function matchTerminalNotice(
+  raw: string,
+  text: string,
+  head: string,
+  code: 'TRANSPORT' | 'RATE_LIMIT',
+  message: string,
+  final: boolean,
+): AgentNoticeVerdict | undefined {
+  const full = `${head}.`
+  const marked = raw.includes('⚠')
+  if (text === full || (marked && text.startsWith(`${full} `))) {
+    // Without `⚠`, hold until `final` so a model reply that quotes the sentence
+    // and continues explaining it is emitted intact.
+    return marked || final ? { kind: 'error', code, message } : { kind: 'hold' }
+  }
+  if (text === head) {
+    return final ? { kind: 'error', code, message } : { kind: 'hold' }
+  }
+  if (!final && full.startsWith(text)) {
+    return { kind: 'hold' }
+  }
+  return undefined
 }
 
 /**
@@ -50,6 +92,29 @@ export function classifyOutputLimitNotice(raw: string): 'drop' | 'hold' | 'emit'
   if (OUTPUT_LIMIT_TAIL.startsWith(stripped) && stripped.startsWith('please continue from where you left off')) return 'hold'
   if ('retries remaining:'.startsWith(text) && text.startsWith('retries')) return 'hold'
   return 'emit'
+}
+
+/**
+ * Classify buffered `agent_message_chunk` text against agy's non-model notices.
+ * @param raw - buffered message text since the last emitted or dropped chunk.
+ * @param final - true when the message stream ended or switched away from text.
+ * @returns how the turn should handle `raw`.
+ */
+export function classifyAgentNotice(raw: string, final = false): AgentNoticeVerdict {
+  const outputLimit = classifyOutputLimitNotice(raw)
+  if (outputLimit === 'drop') return { kind: 'drop' }
+  if (outputLimit === 'hold') return final ? { kind: 'emit' } : { kind: 'hold' }
+  if (AGENT_RETRY_NOTICE.test(raw)) return { kind: 'drop' }
+  if (!final && (WARNING_PREFIX.test(raw) || AGENT_RETRY_PREFIX.test(raw.trim()))) {
+    return { kind: 'hold' }
+  }
+  const text = noticeText(raw)
+  if (text.length === 0) return { kind: 'emit' }
+  const network = matchTerminalNotice(raw, text, NETWORK_ISSUE_HEAD, 'TRANSPORT', NETWORK_ISSUE_MESSAGE, final)
+  if (network !== undefined) return network
+  const traffic = matchTerminalNotice(raw, text, HIGH_TRAFFIC_HEAD, 'RATE_LIMIT', HIGH_TRAFFIC_MESSAGE, final)
+  if (traffic !== undefined) return traffic
+  return { kind: 'emit' }
 }
 
 /** Tool the agent calls to keep waiting on a relayed DSH tool result. */
@@ -88,6 +153,16 @@ export interface ParkedCall {
   readonly result: Deferred<BridgeToolResult>
 }
 
+/** One native built-in tool permission refusal observed during an ACP turn. */
+export interface NativePermissionDenial {
+  readonly tool: string
+  readonly reason: string
+  readonly sandboxMode: NativeSandboxMode
+}
+
+/** Maximum in-place continuation prompts sent per turn when `agy` ends a turn right after a native permission denial. */
+export const MAX_PERMISSION_CONTINUATIONS = 2
+
 /** Event observed during one ACP turn. */
 export type TurnEvent =
   | { kind: 'thought'; text: string }
@@ -95,6 +170,44 @@ export type TurnEvent =
   | { kind: 'park'; call: ParkedCall }
   | { kind: 'done'; result: AcpPromptResult }
   | { kind: 'error'; error: Error }
+
+/**
+ * Failure that ends one step as degraded, so the harness request-retry layer
+ * asks for the identical request again about a second later and the plugin
+ * re-answers inside the same ACP session.
+ * @returns the tagged failure with the harness retry hint.
+ */
+export function degradedRouteError(): LlmError {
+  return new LlmError(
+    labeled('DEGRADED_ROUTE', '上游把这次回答分到了降级线路，已在原会话重新生成。'),
+    'DEGRADED_ROUTE',
+    { providerRetryAfterMs: 1_000 },
+  )
+}
+
+/**
+ * Failure that ends a step whose degraded tool call never recovered within the
+ * automatic re-answer budget; the tool was never executed.
+ * @returns the terminal failure.
+ */
+export function degradedExhaustedError(): LlmError {
+  return new LlmError(
+    labeled('DEGRADED_ROUTE_EXHAUSTED', '上游连续把这次回答分到了降级线路；本次工具调用没有执行，请稍后重试。'),
+    'DEGRADED_ROUTE_EXHAUSTED',
+  )
+}
+
+/**
+ * Whether a failure asks for (or reports the end of) an automatic re-answer.
+ * Neither is upstream quota: such failures must never cool an account down,
+ * fail a step over to another account, or reset the ACP session.
+ * @param error - the failure.
+ * @returns true for {@link degradedRouteError} and {@link degradedExhaustedError}.
+ */
+export function isReanswerFailure(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code
+  return code === 'DEGRADED_ROUTE' || code === 'DEGRADED_ROUTE_EXHAUSTED'
+}
 
 /** One running ACP prompt turn. */
 export class AcpTurn {
@@ -107,6 +220,12 @@ export class AcpTurn {
   toolSteps = 0
   /** Long-decode continuations sent in this turn. */
   continuations = 0
+  /** In-place continuations sent after `agy` aborted `session/prompt` on a denied native built-in tool call. */
+  permissionContinuations = 0
+  /** Unhandled native built-in permission denials since the last visible text or MCP tool park. */
+  readonly pendingNativeDenials: NativePermissionDenial[] = []
+  /** Most recent native built-in permission denial in this turn, used as visible fallback after continuation cap. */
+  lastNativeDenial: NativePermissionDenial | undefined
   /** The agent ended the prompt. */
   finished = false
   /** A parked call was answered with a still-running notice and the agent has not resumed waiting yet. */
@@ -115,7 +234,9 @@ export class AcpTurn {
   produced = false
   /** Agent-side transport retry notices dropped from the output. */
   retryNotices = 0
-  /** Message text that may still be the start of agy's output-cap notice. */
+  /** Terminal transport or overload failure reported as message text by agy. */
+  agentFailure: LlmError | undefined
+  /** Message text that may still be the start of an agy status notice. */
   private noticeHold = ''
   /** Model calls inside this turn whose usage was already emitted per-step from SQLite. */
   emittedCalls = 0
@@ -127,10 +248,17 @@ export class AcpTurn {
     cachedWriteTokens: 0,
     thoughtTokens: 0,
   }
+  /** Usage read from the session DB for the step that is ending, not yet reported. */
+  private stagedUsage: StepUsageSample | undefined
+  /** Built-in non-MCP toolCallIds already traced to `reasoning` in `native` mode. */
+  private readonly tracedToolCallIds = new Set<string>()
   private nextCall = 0
 
-  /** @param sessionTag - short ACP session tag used in synthesized call ids. */
-  constructor(private readonly sessionTag: string) {}
+  /**
+   * @param turnTag - unique per-turn hex tag used in synthesized call ids (`agy_<turnTag>_<n>`).
+   * @param nativeMode - whether to emit concise `[agy]` reasoning traces for built-in tool calls.
+   */
+  constructor(private readonly turnTag: string, private readonly nativeMode = false) {}
 
   /**
    * Record one batch of per-step model usage read from the local session DB.
@@ -146,14 +274,77 @@ export class AcpTurn {
   }
 
   /**
+   * Hold usage a read consumed for the step that is ending, so it is reported exactly
+   * once: the degradation gate and the end-of-turn check read the same batch the step
+   * reports, and a second read would find nothing left.
+   * @param sample - usage of the model steps read so far in this step.
+   */
+  stageStepUsage(sample: StepUsageSample): void {
+    const staged = this.stagedUsage
+    if (staged === undefined) {
+      this.stagedUsage = { calls: sample.calls, usage: { ...sample.usage }, steps: [...sample.steps] }
+      return
+    }
+    staged.calls += sample.calls
+    staged.steps.push(...sample.steps)
+    staged.usage.inputTokens = (staged.usage.inputTokens ?? 0) + (sample.usage.inputTokens ?? 0)
+    staged.usage.outputTokens = (staged.usage.outputTokens ?? 0) + (sample.usage.outputTokens ?? 0)
+    staged.usage.cachedReadTokens = (staged.usage.cachedReadTokens ?? 0) + (sample.usage.cachedReadTokens ?? 0)
+    staged.usage.cachedWriteTokens = (staged.usage.cachedWriteTokens ?? 0) + (sample.usage.cachedWriteTokens ?? 0)
+    staged.usage.thoughtTokens = (staged.usage.thoughtTokens ?? 0) + (sample.usage.thoughtTokens ?? 0)
+    staged.usage.totalTokens = (staged.usage.totalTokens ?? 0) + (sample.usage.totalTokens ?? 0)
+  }
+
+  /**
+   * Take the usage staged for the step that is ending.
+   * @returns the staged sample and clears it.
+   */
+  takeStepUsage(): StepUsageSample | undefined {
+    const staged = this.stagedUsage
+    this.stagedUsage = undefined
+    return staged
+  }
+
+  /**
+   * Whether an earlier read already staged usage for the step that is ending: the
+   * tool gate and the end-of-turn check read the generation this step reports.
+   */
+  hasStagedUsage(): boolean {
+    return this.stagedUsage !== undefined
+  }
+
+  /**
+   * Drop the usage staged for a step that will never be delivered, counting it as
+   * already emitted so a later fallback subtraction never reports it twice.
+   */
+  discardStagedUsage(): void {
+    const staged = this.takeStepUsage()
+    if (staged !== undefined) this.recordStepBatch(staged)
+  }
+
+  /**
+   * Record one denied native built-in tool call so an immediate zero-output
+   * `end_turn` from `agy` can continue in-place instead of failing with `EMPTY_RESPONSE`.
+   * @param denial - the refused native built-in call details.
+   */
+  noteNativeDenial(denial: NativePermissionDenial): void {
+    this.pendingNativeDenials.push(denial)
+    this.lastNativeDenial = denial
+  }
+
+  /**
    * Register one agent tool call.
    * @param name - DSH tool name.
    * @param args - parsed arguments.
    * @returns the parked call.
    */
   park(name: string, args: Record<string, unknown>): ParkedCall {
+    const held = this.recoverNoticeHold()
+    if (held.length > 0 && !this.relaying) this.events.push({ kind: 'text', text: held })
+    this.agentFailure = undefined
+    this.pendingNativeDenials.length = 0
     const call: ParkedCall = {
-      id: ToolCallId(`agy_${this.sessionTag}_${++this.nextCall}`),
+      id: ToolCallId(`agy_${this.turnTag}_${++this.nextCall}`),
       name,
       argumentsJson: JSON.stringify(args),
       result: deferred<BridgeToolResult>(),
@@ -177,40 +368,81 @@ export class AcpTurn {
       const held = this.recoverNoticeHold()
       if (held.length > 0 && !this.relaying) this.events.push({ kind: 'text', text: held })
       if (text.length > 0 && !this.relaying) this.events.push({ kind: 'thought', text })
+      return
+    }
+    if (
+      this.nativeMode
+      && (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update')
+      && typeof update.toolCallId === 'string'
+      && update.toolCallId.length > 0
+      && !this.tracedToolCallIds.has(update.toolCallId)
+    ) {
+      const summary = summarizeNativeBuiltinToolUpdate(update)
+      if (summary !== undefined) {
+        this.tracedToolCallIds.add(update.toolCallId)
+        const held = this.recoverNoticeHold()
+        if (held.length > 0 && !this.relaying) this.events.push({ kind: 'text', text: held })
+        if (!this.relaying) this.events.push({ kind: 'thought', text: `\n[agy] ${summary}\n` })
+      }
     }
   }
 
   /**
-   * Keep a message chunk out of the chat while it is only agy's output-cap notice.
+   * Keep a message chunk out of the chat while it matches or may still complete an agy status notice.
    * @param text - one streamed message chunk.
    */
   private consumeMessage(text: string): void {
+    if (this.noticeHold.length === 0 && this.agentFailure !== undefined && text.trim().length === 0) {
+      return
+    }
     const combined = this.noticeHold + text
-    const kind = classifyOutputLimitNotice(combined)
-    if (kind === 'hold') {
+    const verdict = classifyAgentNotice(combined, false)
+    if (verdict.kind === 'hold') {
       this.noticeHold = combined
       return
     }
     this.noticeHold = ''
-    if (kind === 'drop' || AGENT_RETRY_NOTICE.test(combined)) {
+    if (verdict.kind === 'drop') {
       this.retryNotices++
       return
+    }
+    if (verdict.kind === 'error') {
+      this.retryNotices++
+      this.agentFailure = new LlmError(labeled(verdict.code, verdict.message), verdict.code)
+      return
+    }
+    if (combined.trim().length > 0) {
+      this.agentFailure = undefined
+      this.pendingNativeDenials.length = 0
     }
     if (!this.relaying) this.events.push({ kind: 'text', text: combined })
   }
 
   /**
    * Release a held prefix once the message stream moves on.
-   * A finished output-cap notice is counted and discarded; anything else is returned for emission.
+   * A finished agy notice is counted and discarded (or recorded on `agentFailure`); anything else is returned for emission.
    * @returns model text to show, or an empty string.
    */
   recoverNoticeHold(): string {
     if (this.noticeHold.length === 0) return ''
     const held = this.noticeHold
     this.noticeHold = ''
-    if (classifyOutputLimitNotice(held) === 'drop') {
+    const verdict = classifyAgentNotice(held, true)
+    if (verdict.kind === 'drop') {
       this.retryNotices++
       return ''
+    }
+    if (verdict.kind === 'error') {
+      this.retryNotices++
+      this.agentFailure = new LlmError(labeled(verdict.code, verdict.message), verdict.code)
+      return ''
+    }
+    if (this.agentFailure !== undefined && WARNING_PREFIX.test(held)) {
+      return ''
+    }
+    if (held.trim().length > 0) {
+      this.agentFailure = undefined
+      this.pendingNativeDenials.length = 0
     }
     return this.relaying ? '' : held
   }
@@ -227,20 +459,65 @@ export class AcpTurn {
   }
 }
 
+function summarizeNativeBuiltinToolUpdate(update: AcpSessionUpdate): string | undefined {
+  const meta = update._meta
+  const mcpServer = update.mcpServerName ?? meta?.mcpServerName ?? meta?.serverName ?? meta?.server
+  if (typeof mcpServer === 'string' && mcpServer.length > 0) return undefined
+  if (typeof update.mcpToolName === 'string' && update.mcpToolName.length > 0) return undefined
+  if (typeof meta?.mcpToolName === 'string' && meta?.mcpToolName.length > 0) return undefined
+  const rawName = typeof update.name === 'string' && update.name.trim().length > 0
+    ? update.name.trim()
+    : (typeof meta?.name === 'string' && meta.name.trim().length > 0 ? meta.name.trim() : '')
+  const rawTitle = typeof update.title === 'string' ? update.title.replace(/\s+/gu, ' ').trim() : ''
+  if (rawName.startsWith('mcp_') || rawTitle.startsWith('mcp_')) return undefined
+  let detail = ''
+  if (Array.isArray(update.locations) && typeof update.locations[0]?.path === 'string') {
+    detail = update.locations[0].path.trim()
+  } else if (update.rawInput !== null && typeof update.rawInput === 'object' && !Array.isArray(update.rawInput)) {
+    const rec = update.rawInput as Record<string, unknown>
+    const candidate = rec.Path ?? rec.path ?? rec.CommandLine ?? rec.command ?? rec.query
+    if (typeof candidate === 'string') detail = candidate.replace(/\s+/gu, ' ').trim()
+  }
+  if (detail.length > 100) detail = `${detail.slice(0, 99)}…`
+  const head = rawTitle.length > 0
+    ? (rawName.length > 0 && rawTitle !== rawName && !rawTitle.includes(rawName) ? `${rawName}: ${rawTitle}` : rawTitle)
+    : (rawName.length > 0 ? rawName : (typeof update.kind === 'string' && update.kind.length > 0 && update.kind !== 'other' ? update.kind : ''))
+  if (head.length === 0) return undefined
+  const full = detail.length > 0 && !head.includes(detail) ? `${head} (${detail})` : head
+  return full.length > 160 ? `${full.slice(0, 159)}…` : full
+}
+
 /** Effects the pump needs from its owner. */
 export interface PumpHost {
   /** Window that groups parallel tool calls. */
   parkSettleMs: number
   /** Allowed long-decode continuations. */
   maxContinuations: number
+  /** Allowed in-place continuations after native built-in permission denials (default {@link MAX_PERMISSION_CONTINUATIONS}). */
+  maxPermissionContinuations?: number
+  /** Hold `text` chunks in memory while zero `thought` chunks have arrived in the current attempt. */
+  holdZeroThoughtText?: boolean
   /** Send one continuation prompt in the same session; resolves with its result. */
   continuePrompt(): Promise<AcpPromptResult>
+  /** Send one in-place sandbox-policy refusal notice in the same session when `agy` aborts a turn after denying a built-in tool. */
+  continueAfterPermissionDenial?(denials: readonly NativePermissionDenial[]): Promise<AcpPromptResult>
   /** Request cancellation of the running turn. */
   cancel(): void
   /** Observe the final usage of a prompt turn. */
   recordUsage(usage: AcpPromptResult['usage'], steps: number): void
-  /** Read per-step model usage committed to the local session DB since the previous step. */
-  consumeStepUsage?(): Promise<{ usage: NonNullable<AcpPromptResult['usage']>; calls: number } | undefined>
+  /**
+   * Read the per-step model usage committed to the local session DB since the
+   * previous step and report it for the step that is ending.
+   * @param options.final - true for the step that ends the ACP turn, the only
+   * point where the turn's usage is reconciled against the completed steps.
+   */
+  consumeStepUsage?(options: { final: boolean }): Promise<{ usage: NonNullable<AcpPromptResult['usage']>; calls: number } | undefined>
+  /**
+   * Verify SQLite `gen_metadata` on `end_turn` before the answer is delivered.
+   * `degrade` discards the held answer and fails the step so the harness
+   * re-asks the identical request.
+   */
+  verifyEndTurn?(hadZeroThoughtHold: boolean): Promise<'ok' | 'degrade'>
 }
 
 /**
@@ -302,11 +579,24 @@ export async function * pumpStep(turn: AcpTurn, host: PumpHost, signal: AbortSig
     yield type === 'text' ? { type: 'text-delta', index: open.index, text } : { type: 'reasoning-delta', index: open.index, text }
   }
 
+  let sawStepThought = false
+  let heldZeroThoughtText = ''
+  let emittedVisibleText = false
+  const flushHeldText = function * (): Generator<StreamChunk> {
+    if (heldZeroThoughtText.length === 0) return
+    const text = heldZeroThoughtText
+    heldZeroThoughtText = ''
+    turn.produced = true
+    emittedVisibleText = true
+    yield * append('text', text)
+  }
+
   for (;;) {
     const ready = await turn.events.wait(signal)
     if (!ready) {
       host.cancel()
       turn.abandon('The harness cancelled this request.')
+      heldZeroThoughtText = ''
       yield * close()
       yield { type: 'finish', reason: { kind: 'aborted', failure: { message: 'Request aborted', code: 'ABORTED' } } }
       return
@@ -314,20 +604,33 @@ export async function * pumpStep(turn: AcpTurn, host: PumpHost, signal: AbortSig
     if (turn.events.peek()?.kind !== 'text') {
       const held = turn.recoverNoticeHold()
       if (held.length > 0) {
-        turn.produced = true
-        yield * append('text', held)
+        if (host.holdZeroThoughtText === true && !sawStepThought && !emittedVisibleText) {
+          heldZeroThoughtText += held
+        } else {
+          turn.produced = true
+          emittedVisibleText = true
+          yield * append('text', held)
+        }
       }
     }
     const event = turn.events.shift() as TurnEvent
     switch (event.kind) {
       case 'thought':
+        sawStepThought = true
+        yield * flushHeldText()
         yield * append('reasoning', event.text)
         break
       case 'text':
-        turn.produced = true
-        yield * append('text', event.text)
+        if (host.holdZeroThoughtText === true && !sawStepThought && !emittedVisibleText) {
+          heldZeroThoughtText += event.text
+        } else {
+          turn.produced = true
+          emittedVisibleText = true
+          yield * append('text', event.text)
+        }
         break
       case 'park': {
+        yield * flushHeldText()
         turn.produced = true
         yield * close()
         const batch: ParkedCall[] = [event.call]
@@ -345,7 +648,7 @@ export async function * pumpStep(turn: AcpTurn, host: PumpHost, signal: AbortSig
           yield { type: 'tool-call-delta', index: blockIndex, id: call.id, name: call.name, argumentsDelta: call.argumentsJson }
           yield { type: 'block-end', index: blockIndex, block: { type: 'tool-call', id: call.id, name: call.name, arguments: call.argumentsJson } }
         }
-        const stepSample = await host.consumeStepUsage?.()
+        const stepSample = await host.consumeStepUsage?.({ final: false })
         if (stepSample !== undefined) {
           const usage = toTokenUsage(stepSample.usage, stepSample.calls)
           if (usage !== undefined) yield { type: 'usage', usage }
@@ -355,8 +658,15 @@ export async function * pumpStep(turn: AcpTurn, host: PumpHost, signal: AbortSig
         return
       }
       case 'done': {
+        if (turn.agentFailure !== undefined) {
+          heldZeroThoughtText = ''
+          turn.finished = true
+          yield * close()
+          throw turn.agentFailure
+        }
         const stop = event.result.stopReason
         if (stop === 'max_tokens' && turn.continuations < host.maxContinuations) {
+          yield * flushHeldText()
           turn.continuations++
           void host.continuePrompt().then(
             result => turn.events.push({ kind: 'done', result }),
@@ -364,11 +674,44 @@ export async function * pumpStep(turn: AcpTurn, host: PumpHost, signal: AbortSig
           )
           break
         }
+        if (stop === 'end_turn' && turn.pendingNativeDenials.length > 0) {
+          const denials = turn.pendingNativeDenials.splice(0)
+          const maxPermCont = host.maxPermissionContinuations ?? MAX_PERMISSION_CONTINUATIONS
+          if (host.continueAfterPermissionDenial !== undefined && turn.permissionContinuations < maxPermCont) {
+            yield * flushHeldText()
+            turn.permissionContinuations++
+            void host.continueAfterPermissionDenial(denials).then(
+              result => turn.events.push({ kind: 'done', result }),
+              (error: unknown) => turn.events.push({ kind: 'error', error: error instanceof Error ? error : new Error(String(error)) }),
+            )
+            break
+          }
+        }
+        if (stop === 'end_turn' && host.verifyEndTurn !== undefined) {
+          const hadZeroThoughtHold = !sawStepThought && heldZeroThoughtText.length > 0 && !emittedVisibleText
+          if (await host.verifyEndTurn(hadZeroThoughtHold) === 'degrade') {
+            // The degraded answer is discarded: held text never reaches the
+            // transcript, and the step fails so the harness re-asks the same
+            // request. Reasoning already streamed stays.
+            heldZeroThoughtText = ''
+            turn.finished = true
+            yield * close()
+            throw degradedRouteError()
+          }
+        }
+        yield * flushHeldText()
+        if (stop === 'end_turn' && !turn.produced && turn.lastNativeDenial !== undefined) {
+          const d = turn.lastNativeDenial
+          const fallback = `Operation refused by DSH sandbox policy (${d.sandboxMode}): ${d.tool} (${d.reason}).`
+          turn.produced = true
+          emittedVisibleText = true
+          yield * append('text', fallback)
+        }
         turn.finished = true
         yield * close()
-        const calls = turn.toolSteps + turn.continuations + 1
+        const calls = turn.toolSteps + turn.continuations + turn.permissionContinuations + 1
         host.recordUsage(event.result.usage, calls)
-        const finalSample = await host.consumeStepUsage?.()
+        const finalSample = await host.consumeStepUsage?.({ final: true })
         let usage: TokenUsage | undefined
         if (finalSample !== undefined) {
           usage = toTokenUsage(finalSample.usage, finalSample.calls)
@@ -394,7 +737,7 @@ export async function * pumpStep(turn: AcpTurn, host: PumpHost, signal: AbortSig
         }
         if (usage !== undefined) yield { type: 'usage', usage }
         if (stop === 'end_turn' && !turn.produced) {
-          throw new LlmError('Antigravity ended the turn without visible output', 'EMPTY_RESPONSE')
+          throw new LlmError(labeled('EMPTY_RESPONSE', 'Antigravity ended the turn without visible output'), 'EMPTY_RESPONSE')
         }
         switch (stop) {
           case 'end_turn':
@@ -407,7 +750,7 @@ export async function * pumpStep(turn: AcpTurn, host: PumpHost, signal: AbortSig
             yield { type: 'finish', reason: { kind: 'aborted', failure: { message: 'Antigravity cancelled the turn', code: 'ABORTED' } } }
             return
           case 'refusal':
-            yield { type: 'finish', reason: { kind: 'error', failure: { message: 'Antigravity refused the request', code: 'REFUSAL' } } }
+            yield { type: 'finish', reason: { kind: 'error', failure: { message: labeled('REFUSAL', 'Antigravity refused the request'), code: 'REFUSAL' } } }
             return
           default:
             yield { type: 'finish', reason: { kind: 'error', failure: { message: `Antigravity stopped: ${stop}`, code: 'PROVIDER_ERROR' } } }

@@ -8,23 +8,41 @@
  * removes every built-in tool so the agent acts only through DSH tools.
  * @module dsh-llm-antigravity-acp/preflight
  */
-import { existsSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, writeFileSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { delimiter, isAbsolute, join } from 'node:path';
+import { delimiter, dirname, isAbsolute, join } from 'node:path';
 /** Agent id installed in the isolated home. */
 export const BRIDGE_AGENT = 'dsh-bridge';
+/** Minimum official CLI version supporting `agy acp --process-per-session`. */
+export const MIN_AGY_VERSION = [1, 4, 12];
+/** Default model display name pre-seeded into isolated `settings.json` files. */
+export const DEFAULT_SEEDED_MODEL = 'Gemini 4 Argon (High)';
+/** Default context-window label aligned with `~/.gemini/antigravity-cli/settings.json`. */
+export const DEFAULT_SEEDED_CONTEXT_WINDOW = '512K';
 /** Context window the official binary enforces without the unlock. */
 export const LOCKED_CONTEXT_WINDOW = 256_000;
 /** Physical context window of the Gemini 4, Gemini 3.8, and Claude 5.5 families. */
 export const UNLOCKED_CONTEXT_WINDOW = 1_048_576;
 /** GPT-OSS 120B keeps its own 128K-class window and is not covered by the unlock. */
 export const GPT_OSS_CONTEXT_WINDOW = 131_072;
+function splitPathDirs(env, platform) {
+    const raw = env.PATH ?? env.Path ?? '';
+    const sep = platform === 'win32' ? ';' : delimiter;
+    const dirs = [];
+    for (const part of raw.split(sep)) {
+        const cleaned = part.trim().replace(/^"(.*)"$/, '$1');
+        if (cleaned.length > 0)
+            dirs.push(cleaned);
+    }
+    return dirs;
+}
 /**
  * Locate the `agy` executable.
  * @param configured - configured absolute path, or empty.
+ * @param options - optional platform/env overrides for testing.
  * @returns the executable path.
  */
-export function resolveAgyBinary(configured) {
+export function resolveAgyBinary(configured, options = {}) {
     if (configured.length > 0) {
         if (!isAbsolute(configured))
             throw new Error(`antigravity-acp: command must be an absolute path, got ${configured}`);
@@ -32,16 +50,81 @@ export function resolveAgyBinary(configured) {
             throw new Error(`antigravity-acp: configured agy binary not found at ${configured}`);
         return configured;
     }
-    const candidates = [join(homedir(), '.local', 'bin', 'agy')];
-    for (const dir of (process.env.PATH ?? '').split(delimiter)) {
-        if (dir.length > 0)
-            candidates.push(join(dir, 'agy'));
+    const platform = options.platform ?? process.platform;
+    const env = options.env ?? process.env;
+    const home = options.home ?? homedir();
+    const exeName = platform === 'win32' ? 'agy.exe' : 'agy';
+    const candidates = [];
+    if (platform === 'win32') {
+        const localAppData = env.LOCALAPPDATA && env.LOCALAPPDATA.length > 0
+            ? env.LOCALAPPDATA
+            : join(home, 'AppData', 'Local');
+        candidates.push(join(localAppData, 'agy', 'bin', 'agy.exe'));
+        candidates.push(join(home, '.local', 'bin', 'agy.exe'));
+    }
+    else {
+        candidates.push(join(home, '.local', 'bin', 'agy'));
+    }
+    for (const dir of splitPathDirs(env, platform)) {
+        candidates.push(join(dir, exeName));
     }
     const found = candidates.find(candidate => existsSync(candidate));
     if (found === undefined) {
         throw new Error('antigravity-acp: the Antigravity CLI (agy) was not found; install it from https://antigravity.google/docs/install?tab=cli and sign in once with `agy`');
     }
     return found;
+}
+/**
+ * Locate a working Python 3 command for `agy-patch.py`, skipping Windows Store
+ * zero-byte `WindowsApps\python*.exe` alias stubs.
+ * @param options - optional platform/env overrides for testing.
+ * @returns command argv prefix (e.g. `['D:\\Python\\python.exe']` or `['C:\\Windows\\py.exe', '-3']`).
+ */
+export function resolvePythonArgv(options = {}) {
+    const platform = options.platform ?? process.platform;
+    if (platform !== 'win32') {
+        return [existsSync('/usr/bin/python3') ? '/usr/bin/python3' : 'python3'];
+    }
+    const env = options.env ?? process.env;
+    for (const dir of splitPathDirs(env, platform)) {
+        if (/[/\\]Microsoft[/\\]WindowsApps(?:[/\\]|$)/i.test(dir))
+            continue;
+        for (const name of ['python.exe', 'python3.exe']) {
+            const candidate = join(dir, name);
+            try {
+                if (statSync(candidate).size > 0)
+                    return [candidate];
+            }
+            catch (_missingPython) {
+                // Candidate does not exist in this PATH entry.
+            }
+        }
+    }
+    const sysRoot = env.SystemRoot && env.SystemRoot.length > 0 ? env.SystemRoot : 'C:\\Windows';
+    const pyLauncher = join(sysRoot, 'py.exe');
+    if (existsSync(pyLauncher))
+        return [pyLauncher, '-3'];
+    return ['python'];
+}
+/**
+ * Reject outdated official `agy` binaries that predate ACP multi-session support.
+ * Non-semver diagnostic strings (`unknown`, test doubles) pass through.
+ * @param version - version string from `readVersion`.
+ * @param binary - resolved executable path.
+ */
+export function assertSupportedAgyVersion(version, binary) {
+    const match = /^(?:antigravity(?:\s+cli)?\s+)?v?(\d+)\.(\d+)\.(\d+)\b/i.exec(version.trim());
+    if (match === null)
+        return;
+    const major = Number(match[1]);
+    const minor = Number(match[2]);
+    const patch = Number(match[3]);
+    const [minMajor, minMinor, minPatch] = MIN_AGY_VERSION;
+    const supported = major > minMajor
+        || (major === minMajor && (minor > minMinor || (minor === minMinor && patch >= minPatch)));
+    if (!supported) {
+        throw new Error(`antigravity-acp: Antigravity CLI ${version.trim()} at ${binary} is too old (requires >= 1.5.0); run \`agy update\` to upgrade`);
+    }
 }
 /**
  * Default isolated home.
@@ -52,33 +135,174 @@ export function defaultHome() {
     return join(dshHome, 'cache', 'antigravity-acp');
 }
 /**
- * Write the isolated Antigravity home: bridge agent and ACP settings.
+ * Seed or refresh the isolated `antigravity-oauth-token` file from the account's
+ * CLI home (`<userHome>/.gemini/antigravity-cli` or `<userHome>/.gemini/antigravity`)
+ * whenever the host uses file-backed token storage (Windows / headless Linux)
+ * or the user signed in again from a terminal.
+ * @param home - isolated `--gemini-dir` root.
+ * @param userHome - user home owning the source token file.
+ */
+export function syncOAuthToken(home, userHome = homedir()) {
+    const appData = join(home, 'agy');
+    const dst = join(appData, 'antigravity-oauth-token');
+    const sources = [
+        join(userHome, '.gemini', 'antigravity-cli', 'antigravity-oauth-token'),
+        join(userHome, '.gemini', 'antigravity', 'antigravity-oauth-token'),
+    ];
+    let newestSrc;
+    for (const candidate of sources) {
+        try {
+            const st = statSync(candidate);
+            if (st.size > 0 && (newestSrc === undefined || st.mtimeMs > newestSrc.mtimeMs)) {
+                newestSrc = { path: candidate, mtimeMs: st.mtimeMs };
+            }
+        }
+        catch (_missingSrc) {
+            // Source token file does not exist.
+        }
+    }
+    if (newestSrc === undefined)
+        return;
+    try {
+        const dstStat = statSync(dst);
+        if (dstStat.size > 0 && dstStat.mtimeMs >= newestSrc.mtimeMs)
+            return;
+    }
+    catch (_missingDst) {
+        // Destination token file does not exist yet.
+    }
+    mkdirSync(appData, { recursive: true });
+    copyFileSync(newestSrc.path, dst);
+    try {
+        chmodSync(dst, 0o600);
+    }
+    catch (_advisoryMode) {
+        // Mode bits are advisory on Windows.
+    }
+}
+/**
+ * Write the isolated Antigravity home: bridge agent, ACP settings, the default
+ * CLI project record, and completed onboarding state.
  * @param home - absolute home directory used as `--gemini-dir`.
+ * @param userHome - optional user home override for file-backed token sync.
  * @returns the empty workspace directory used as every session's cwd.
  */
-export function prepareHome(home) {
+export function prepareHome(home, userHome = homedir()) {
     const agentDir = join(home, 'config', 'plugins', BRIDGE_AGENT, 'agents');
     mkdirSync(agentDir, { recursive: true });
     writeIfChanged(join(home, 'config', 'plugins', BRIDGE_AGENT, 'plugin.json'), `${JSON.stringify({ name: BRIDGE_AGENT }, null, 2)}\n`);
     writeIfChanged(join(agentDir, `${BRIDGE_AGENT}.md`), [
         '---',
         `name: ${BRIDGE_AGENT}`,
-        'description: "DeepSeek Harness primary-model bridge: no built-in tools, harness tools only"',
+        'description: "Primary-model bridge: no built-in tools, harness tools only"',
         'tools: []',
         'excludeDefaultComponents: true',
         'mainAgent: true',
         '---',
+        '<identity>',
+        'You are Antigravity, a powerful agentic AI coding assistant designed by the Google DeepMind team working on Advanced Agentic Coding.',
+        'You are an interactive CLI tool that helps users with software engineering tasks.',
+        '</identity>',
         'Follow the appended system instructions exactly. Act only through the harness tools you are given.',
         '',
     ].join('\n'));
     const appData = join(home, 'agy');
-    mkdirSync(appData, { recursive: true });
-    const settingsPath = join(appData, 'settings.json');
-    const settings = readJson(settingsPath);
-    writeIfChanged(settingsPath, `${JSON.stringify({ ...settings, toolPermission: 'request-review', agentMode: '' }, null, 2)}\n`);
+    mkdirSync(join(appData, 'conversations'), { recursive: true });
+    mkdirSync(join(home, 'antigravity', 'conversations'), { recursive: true });
+    syncOAuthToken(home, userHome);
+    const hostUseAiCredits = readHostUseAiCredits(userHome);
+    seedHostAiCreditsConfig(join(home, 'config', 'config.json'), hostUseAiCredits);
+    seedCliSettingsFile(join(appData, 'settings.json'), userHome, hostUseAiCredits);
+    const defaultCliAppData = join(home, 'antigravity-cli');
+    mkdirSync(defaultCliAppData, { recursive: true });
+    seedCliSettingsFile(join(defaultCliAppData, 'settings.json'), userHome, hostUseAiCredits);
+    seedDefaultCliProject(join(home, 'config', 'projects', `${DEFAULT_CLI_PROJECT_ID}.json`));
+    seedOnboardingFile(join(appData, 'cache', 'onboarding.json'));
+    seedOnboardingFile(join(defaultCliAppData, 'cache', 'onboarding.json'));
     const workspace = join(home, 'workspace');
     mkdirSync(workspace, { recursive: true });
     return workspace;
+}
+/** Project id `agy` resolves for every CLI conversation that names no project. */
+export const DEFAULT_CLI_PROJECT_ID = 'default-cli-project';
+/** Onboarding state seeded into both isolated app-data directories. */
+export const SEEDED_ONBOARDING = { consumerOnboardingComplete: true, enterpriseOnboardingComplete: false, onboardingComplete: true };
+/**
+ * Seed the default CLI project record that `agy` reads on every step; a missing
+ * file logs `project_store_get_file_missing`. A valid record already on disk is
+ * kept, because `agy` owns its `projectResources`.
+ */
+function seedDefaultCliProject(projectPath) {
+    if (readJson(projectPath).id === DEFAULT_CLI_PROJECT_ID)
+        return;
+    mkdirSync(dirname(projectPath), { recursive: true });
+    writeFileSync(projectPath, `${JSON.stringify({ id: DEFAULT_CLI_PROJECT_ID, name: 'CLI Project', projectResources: {} }, null, 2)}\n`);
+}
+/** Mark onboarding complete so the isolated CLI never waits on its interactive onboarding flow. */
+function seedOnboardingFile(onboardingPath) {
+    const existing = readJson(onboardingPath);
+    if (existing.consumerOnboardingComplete === true && existing.onboardingComplete === true)
+        return;
+    mkdirSync(dirname(onboardingPath), { recursive: true });
+    writeFileSync(onboardingPath, `${JSON.stringify({
+        ...existing,
+        consumerOnboardingComplete: true,
+        enterpriseOnboardingComplete: typeof existing.enterpriseOnboardingComplete === 'boolean'
+            ? existing.enterpriseOnboardingComplete
+            : SEEDED_ONBOARDING.enterpriseOnboardingComplete,
+        onboardingComplete: true,
+    })}\n`);
+}
+function readHostUseAiCredits(userHome) {
+    const hostConfig = readJson(join(userHome, '.gemini', 'config', 'config.json'));
+    const userSettings = hostConfig.userSettings;
+    if (userSettings !== null && typeof userSettings === 'object' && !Array.isArray(userSettings)) {
+        const flag = userSettings.useAiCredits;
+        if (typeof flag === 'boolean')
+            return flag;
+    }
+    return undefined;
+}
+function seedHostAiCreditsConfig(configPath, useAiCredits) {
+    if (useAiCredits === undefined)
+        return;
+    const existing = readJson(configPath);
+    const rawSettings = existing.userSettings;
+    const existingSettings = rawSettings !== null && typeof rawSettings === 'object' && !Array.isArray(rawSettings)
+        ? rawSettings
+        : {};
+    mkdirSync(dirname(configPath), { recursive: true });
+    writeIfChanged(configPath, `${JSON.stringify({
+        ...existing,
+        userSettings: {
+            ...existingSettings,
+            useAiCredits,
+        },
+    }, null, 2)}\n`);
+}
+function seedCliSettingsFile(settingsPath, userHome = homedir(), hostUseAiCredits) {
+    const settings = readJson(settingsPath);
+    const hostCliSettings = readJson(join(userHome, '.gemini', 'antigravity-cli', 'settings.json'));
+    const rawModel = typeof settings.model === 'string' ? settings.model.trim() : '';
+    const model = rawModel.length > 0 && rawModel !== 'Gemini 4 Argon (Medium)'
+        ? rawModel
+        : DEFAULT_SEEDED_MODEL;
+    const contextWindow = typeof settings.contextWindow === 'string' && settings.contextWindow.trim().length > 0
+        ? settings.contextWindow
+        : DEFAULT_SEEDED_CONTEXT_WINDOW;
+    const useG1Credits = typeof settings.useG1Credits === 'boolean'
+        ? settings.useG1Credits
+        : typeof hostCliSettings.useG1Credits === 'boolean'
+            ? hostCliSettings.useG1Credits
+            : hostUseAiCredits;
+    writeIfChanged(settingsPath, `${JSON.stringify({
+        ...settings,
+        ...(useG1Credits !== undefined ? { useG1Credits } : {}),
+        contextWindow,
+        model,
+        toolPermission: 'request-review',
+        agentMode: '',
+    }, null, 2)}\n`);
 }
 /**
  * Check the context-window unlock and apply it when allowed.
@@ -86,14 +310,15 @@ export function prepareHome(home) {
  * @param script - unlock script path.
  * @param apply - whether to patch a locked binary.
  * @param run - helper command runner.
+ * @param options - optional platform/env overrides for testing.
  * @returns the unlock state.
  */
-export async function checkUnlock(binary, script, apply, run) {
+export async function checkUnlock(binary, script, apply, run, options = {}) {
     if (!existsSync(script)) {
         return { status: 'unknown', applied: false, detail: `unlock script not found at ${script}; the 256K default applies` };
     }
-    const python = existsSync('/usr/bin/python3') ? '/usr/bin/python3' : 'python3';
-    const dry = await run([python, script, '--binary', binary, '--dry-run'], 120_000);
+    const python = resolvePythonArgv(options);
+    const dry = await run([...python, script, '--binary', binary, '--dry-run'], 120_000);
     const text = `${dry.stdout}\n${dry.stderr}`;
     if (/all gates already unlocked/i.test(text))
         return { status: 'unlocked', applied: false, detail: 'context gates already unlocked' };
@@ -102,11 +327,11 @@ export async function checkUnlock(binary, script, apply, run) {
     }
     if (!apply)
         return { status: 'locked', applied: false, detail: 'binary is locked to 256K and autoPatch is off' };
-    const patched = await run([python, script, '--binary', binary, '--in-place'], 300_000);
+    const patched = await run([...python, script, '--binary', binary, '--in-place'], 300_000);
     if (patched.code !== 0) {
         return { status: 'locked', applied: false, detail: `unlock failed (exit ${patched.code ?? 'null'}): ${patched.stderr.trim().split('\n').slice(-2).join(' ')}` };
     }
-    const verify = await run([python, script, '--binary', binary, '--dry-run'], 120_000);
+    const verify = await run([...python, script, '--binary', binary, '--dry-run'], 120_000);
     return /all gates already unlocked/i.test(`${verify.stdout}\n${verify.stderr}`)
         ? { status: 'unlocked', applied: true, detail: 'context gates unlocked by this preflight' }
         : { status: 'unknown', applied: true, detail: 'unlock applied but verification was inconclusive' };

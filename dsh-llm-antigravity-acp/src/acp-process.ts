@@ -23,7 +23,7 @@ export interface AcpChild {
 }
 
 /** Launches one ACP process. */
-export type AcpSpawner = (argv: readonly string[], cwd: string) => AcpChild
+export type AcpSpawner = (argv: readonly string[], cwd: string, env?: Readonly<NodeJS.ProcessEnv>) => AcpChild
 
 /** Per-session observer of agent notifications and requests. */
 export interface AcpSessionListener {
@@ -31,14 +31,23 @@ export interface AcpSessionListener {
   onPermission?(request: AcpPermissionRequest): AcpPermissionOutcome | undefined
 }
 
+/** File or resource location reported on an ACP tool call. */
+export interface AcpToolLocation {
+  path?: string
+  [key: string]: unknown
+}
+
 /** One `session/update` payload. */
 export interface AcpSessionUpdate {
   sessionUpdate: string
   content?: { type: string; text?: string }
   toolCallId?: string
+  name?: string
   title?: string
   status?: string
   kind?: string
+  locations?: AcpToolLocation[]
+  rawInput?: unknown
   mcpServerName?: string
   mcpToolName?: string
   _meta?: AcpToolCallMeta
@@ -56,6 +65,7 @@ export interface AcpToolCallMeta {
   mcpToolName?: string
   toolName?: string
   tool?: string
+  name?: string
   [key: string]: unknown
 }
 
@@ -74,8 +84,10 @@ export interface AcpPermissionRequest {
   sessionId: string
   toolCall?: {
     toolCallId?: string
+    name?: string
     title?: string
     kind?: string
+    locations?: AcpToolLocation[]
     rawInput?: unknown
     mcpServerName?: string
     mcpToolName?: string
@@ -112,18 +124,11 @@ export interface AcpPromptResult {
   }
 }
 
-/** One HTTP MCP server descriptor passed on session setup. */
-export interface AcpHttpMcpServer {
-  type: 'http'
-  name: string
-  url: string
-  headers: { name: string; value: string }[]
-}
-
 /** Launch parameters of the front process. */
 export interface AcpProcessOptions {
   argv: readonly string[]
   cwd: string
+  env?: Readonly<NodeJS.ProcessEnv>
   spawn: AcpSpawner
   clientName: string
   clientVersion: string
@@ -163,7 +168,7 @@ export class AcpProcess {
    * @param timeoutMs - handshake deadline.
    */
   async start(timeoutMs: number): Promise<void> {
-    const child = this.options.spawn(this.options.argv, this.options.cwd)
+    const child = this.options.spawn(this.options.argv, this.options.cwd, this.options.env)
     this.child = child
     const peer = new JsonRpcPeer(child.stdout, child.stdin, {
       onRequest: (method, params) => this.onRequest(method, params),
@@ -202,6 +207,24 @@ export class AcpProcess {
     const result = await this.link().request<AcpNewSessionResult>('session/new', params, { timeoutMs })
     this.listeners.set(result.sessionId, listener)
     return result
+  }
+
+  /**
+   * Resume an existing durable ACP session (`<sessionId>.db`) with fresh MCP server endpoints.
+   * Attaches `listener` after `session/load` settles so any historical replay chunks emitted
+   * during load are ignored.
+   * @param params - `session/load` parameters (`sessionId`, `cwd`, `mcpServers`, `_meta`).
+   * @param listener - observer bound to the loaded session id.
+   * @param timeoutMs - load deadline.
+   * @returns the loaded session result.
+   */
+  async loadSession(params: Record<string, unknown>, listener: AcpSessionListener, timeoutMs: number): Promise<AcpNewSessionResult> {
+    const result = await this.link().request<AcpNewSessionResult>('session/load', params, { timeoutMs })
+    const sessionId = typeof result?.sessionId === 'string' && result.sessionId.length > 0
+      ? result.sessionId
+      : String(params['sessionId'] ?? '')
+    this.listeners.set(sessionId, listener)
+    return { ...result, sessionId }
   }
 
   /**

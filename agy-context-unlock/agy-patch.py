@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Unlock all context-window gates in the agy CLI (plus optional env-var restore).
 
-Verified end-to-end on macOS arm64, agy 1.4.12 and 1.5.0.
-Container + Go pclntab locating supports Mach-O, ELF, and PE (arm64 & x86-64).
+Verified end-to-end on macOS (arm64), Linux (x86-64 & arm64), and Windows
+(x86-64 & arm64), agy 1.4.12 - 1.5.3. Container + Go pclntab locating supports
+Mach-O, ELF, and PE (arm64 & x86-64).
 
 Gate 1 -- model.SelectorModel.offersContextWindow
     Exposes /model -> Context: [Default] [256K] [512K] [900K] (Tab key) for all
@@ -171,6 +172,91 @@ def _macho_text(data):
     raise PatchError("__text section not found in Mach-O")
 
 
+def _elf_file_to_va(data, file_off):
+    phoff = struct.unpack_from("<Q", data, 32)[0]
+    phentsize, phnum = struct.unpack_from("<HH", data, 54)
+    for i in range(phnum):
+        ph = phoff + i * phentsize
+        if ph + 40 > len(data):
+            break
+        if struct.unpack_from("<I", data, ph)[0] != 1:  # PT_LOAD
+            continue
+        p_offset, p_vaddr, _p_paddr, p_filesz = struct.unpack_from("<QQQQ", data, ph + 8)
+        if p_offset <= file_off < p_offset + p_filesz:
+            return p_vaddr + (file_off - p_offset)
+    return None
+
+
+def _elf_go_text_va(data, t_va, t_sz, relas, symtabs):
+    """Locate Go `runtime.text` inside ELF `.text`.
+
+    External C linkers (glibc / musl cgo PIE) place CRT startup stubs at the
+    head of `.text` (`+0x80` on glibc x86-64, `+0xc0` on musl x86-64 and glibc
+    arm64), while Go `functab` `entryoff` values are relative to `runtime.text`.
+    """
+    pcln_off, _ = find_pclntab(data)
+    text_start, funcname_off = struct.unpack_from("<QQ", data, pcln_off + 24)
+    if t_va <= text_start < t_va + t_sz:
+        return text_start
+
+    pcln_va = _elf_file_to_va(data, pcln_off)
+    if pcln_va is not None:
+        fn_va = pcln_va + funcname_off
+        needle = struct.pack("<q", pcln_va)
+        for roff, rsz, entsz in relas:
+            pos = roff
+            end = roff + rsz
+            while True:
+                hit = data.find(needle, pos, end)
+                if hit < 0:
+                    break
+                pos = hit + 1
+                if (hit - roff) % entsz != 16:
+                    continue
+                ep = hit - 16
+                if ep + 2 * entsz > end:
+                    continue
+                mod_va = struct.unpack_from("<Q", data, ep)[0]
+                r_off2, _, r_add2 = struct.unpack_from("<QQq", data, ep + entsz)
+                if r_off2 != mod_va + 8 or r_add2 != fn_va:
+                    continue
+                mod_text = mod_etext = None
+                for k in range(2, 24):
+                    if ep + (k + 1) * entsz > end:
+                        break
+                    ro, _, ra = struct.unpack_from("<QQq", data, ep + k * entsz)
+                    if ro == mod_va + 0xB0:
+                        mod_text = ra
+                    elif ro == mod_va + 0xB8:
+                        mod_etext = ra
+                if (mod_text is not None and mod_etext is not None
+                        and t_va <= mod_text < mod_etext <= t_va + t_sz):
+                    return mod_text
+
+        pair = struct.pack("<QQ", pcln_va, fn_va)
+        pos = 0
+        while True:
+            hit = data.find(pair, pos)
+            if hit < 0 or hit + 0xC0 > len(data):
+                break
+            pos = hit + 1
+            mod_text, mod_etext = struct.unpack_from("<QQ", data, hit + 0xB0)
+            if t_va <= mod_text < mod_etext <= t_va + t_sz:
+                return mod_text
+
+    for sym_off, sym_sz, entsz, str_off in symtabs:
+        for pos in range(sym_off, sym_off + sym_sz, entsz):
+            if pos + 24 > len(data):
+                break
+            st_name, _info, _other, _shndx, st_val, _sz = struct.unpack_from("<IBBHQQ", data, pos)
+            end = data.find(b"\0", str_off + st_name, str_off + st_name + 64)
+            if end > 0 and data[str_off + st_name:end] == b"runtime.text":
+                if t_va <= st_val < t_va + t_sz:
+                    return st_val
+
+    raise PatchError("cannot locate Go runtime.text base in ELF")
+
+
 def _elf_text(data):
     if data[4] != 2 or data[5] != 1:
         raise PatchError("only 64-bit little-endian ELF is supported")
@@ -181,14 +267,32 @@ def _elf_text(data):
     shoff = struct.unpack_from("<Q", data, 40)[0]
     shentsize, shnum, shstrndx = struct.unpack_from("<HHH", data, 58)
     strtab_off = struct.unpack_from("<Q", data, shoff + shstrndx * shentsize + 24)[0]
+    text_sec = None
+    relas = []
+    symtabs = []
     for i in range(shnum):
         sh = shoff + i * shentsize
-        nameoff = struct.unpack_from("<I", data, sh)[0]
+        nameoff, sh_type = struct.unpack_from("<II", data, sh)
         end = data.find(b"\0", strtab_off + nameoff)
         if data[strtab_off + nameoff:end] == b".text":
-            addr, offset = struct.unpack_from("<QQ", data, sh + 16)
-            return addr, offset, arch
-    raise PatchError(".text section not found in ELF")
+            addr, offset, size = struct.unpack_from("<QQQ", data, sh + 16)
+            text_sec = (addr, offset, size)
+        elif sh_type == 4:  # SHT_RELA
+            r_off, r_sz = struct.unpack_from("<QQ", data, sh + 24)
+            r_ent = struct.unpack_from("<Q", data, sh + 56)[0] or 24
+            relas.append((r_off, r_sz, r_ent))
+        elif sh_type == 2:  # SHT_SYMTAB
+            s_off, s_sz = struct.unpack_from("<QQ", data, sh + 24)
+            s_link = struct.unpack_from("<I", data, sh + 40)[0]
+            s_ent = struct.unpack_from("<Q", data, sh + 56)[0] or 24
+            if s_link < shnum:
+                s_str = struct.unpack_from("<Q", data, shoff + s_link * shentsize + 24)[0]
+                symtabs.append((s_off, s_sz, s_ent, s_str))
+    if text_sec is None:
+        raise PatchError(".text section not found in ELF")
+    t_va, t_off, t_sz = text_sec
+    go_va = _elf_go_text_va(data, t_va, t_sz, relas, symtabs)
+    return go_va, t_off + (go_va - t_va), arch
 
 
 def _pe_text(data):
@@ -488,7 +592,7 @@ def _find_generic_arm64_256k_clamp(body):
     return hits
 
 
-def patch_gate3a_checkpoint(data, funcs, text_va, text_off, arch, limit="512k"):
+def patch_gate3a_checkpoint(data, funcs, text_va, text_off, arch, limit="1m"):
     if FUNC_CHECKPOINT not in funcs:
         raise PatchError(f"symbol not found: {FUNC_CHECKPOINT}")
     entryoff, size = funcs[FUNC_CHECKPOINT]
@@ -530,13 +634,11 @@ def patch_gate3a_checkpoint(data, funcs, text_va, text_off, arch, limit="512k"):
             data[site:site + len(CLAMP_512K_X64)] = CLAMP_512K_X64
             return True, (f"[Gate 3A] {FUNC_CHECKPOINT}: clamped to 512K (0x7d000) "
                           f"@ {fn_va + idx:#x} (cmp/mov $0x7d000, cmovb)")
-        raise PatchError(f"{FUNC_CHECKPOINT}: clamp site not found to set 512K")
+        raise PatchError(f"{FUNC_CHECKPOINT}: x86-64 clamp site not found to set 512K")
 
     # limit == "1m" (uncapped physical limit)
     if arch == "arm64":
         nop6 = NOP_ARM64 * 6
-        if body.find(nop6) >= 0:
-            return False, f"[Gate 3A] {FUNC_CHECKPOINT}: already patched (1M uncapped)"
         idx = body.find(CLAMP_256K_ARM64)
         if idx < 0:
             idx = body.find(CLAMP_512K_ARM64)
@@ -545,7 +647,7 @@ def patch_gate3a_checkpoint(data, funcs, text_va, text_off, arch, limit="512k"):
                 raise PatchError(f"{FUNC_CHECKPOINT}: multiple 256K clamps found")
             site = fn_off + idx
             data[site:site + 24] = nop6
-            return True, (f"[Gate 3A] {FUNC_CHECKPOINT}: removed clamp "
+            return True, (f"[Gate 3A] {FUNC_CHECKPOINT}: removed 256K (0x3e800) clamp "
                           f"@ {fn_va + idx:#x} (6x nop)")
 
         generic = _find_generic_arm64_256k_clamp(body)
@@ -553,14 +655,14 @@ def patch_gate3a_checkpoint(data, funcs, text_va, text_off, arch, limit="512k"):
             rel, length = generic[0]
             site = fn_off + rel
             data[site:site + length] = NOP_ARM64 * (length // 4)
-            return True, (f"[Gate 3A] {FUNC_CHECKPOINT}: removed clamp "
+            return True, (f"[Gate 3A] {FUNC_CHECKPOINT}: removed 256K (0x3e800) clamp "
                           f"@ {fn_va + rel:#x} ({length // 4}x nop)")
 
-        raise PatchError(f"{FUNC_CHECKPOINT}: clamp pattern not found")
+        if body.find(nop6) >= 0:
+            return False, f"[Gate 3A] {FUNC_CHECKPOINT}: already patched"
+        raise PatchError(f"{FUNC_CHECKPOINT}: 256K (0x3e800) clamp pattern not found")
 
     # x86-64
-    if body.find(PATCH_256K_X64) >= 0:
-        return False, f"[Gate 3A] {FUNC_CHECKPOINT}: already patched (1M uncapped)"
     idx = body.find(CLAMP_256K_X64)
     if idx < 0:
         idx = body.find(CLAMP_512K_X64)
@@ -569,10 +671,12 @@ def patch_gate3a_checkpoint(data, funcs, text_va, text_off, arch, limit="512k"):
             raise PatchError(f"{FUNC_CHECKPOINT}: multiple 256K clamps found")
         site = fn_off + idx
         data[site:site + len(PATCH_256K_X64)] = PATCH_256K_X64
-        return True, (f"[Gate 3A] {FUNC_CHECKPOINT}: removed clamp "
+        return True, (f"[Gate 3A] {FUNC_CHECKPOINT}: removed 256K (0x3e800) clamp "
                       f"@ {fn_va + idx:#x} (mov %edx,%esi + 12x nop)")
 
-    raise PatchError(f"{FUNC_CHECKPOINT}: x86-64 clamp pattern not found")
+    if body.find(PATCH_256K_X64) >= 0:
+        return False, f"[Gate 3A] {FUNC_CHECKPOINT}: already patched"
+    raise PatchError(f"{FUNC_CHECKPOINT}: x86-64 256K (0x3e800) clamp pattern not found")
 
 
 # --------------------------------------------------------------------------
@@ -721,24 +825,23 @@ def _x86_step_dispatch(body):
 def _x86_find_epilogue(body, start):
     """Locate `add $imm,%rsp ; pop %rbp ; ret` or `leave ; ret` at/after `start`.
 
-    Returns (jump_rel, pop_rel) where jump_rel is the stack-dealloc site
-    (or the `pop %rbp` site when no `add` precedes it), or None.
+    Returns (jump_rel, end_rel) where jump_rel is the stack-dealloc site
+    (or the `pop %rbp` / `leave` site when no `add` precedes it), or None.
     """
-    pop = body.find(b"\x5d\xc3", start, min(len(body), start + 64))
-    if pop >= 0 and pop >= 4:
-        add = None
-        for rel in range(max(0, pop - 16), pop - 2):
-            if body[rel:rel + 3] == b"\x48\x83\xc4":       # add $imm8, %rsp
-                add = rel
-            elif body[rel:rel + 3] == b"\x48\x81\xc4":     # add $imm32, %rsp
-                add = rel
-        return (add if add is not None else pop), pop
-
-    leave = body.find(b"\xc9\xc3", start, min(len(body), start + 64))
-    if leave >= 0 and leave >= 4:
+    window_end = min(len(body), start + 64)
+    pop = body.find(b"\x5d\xc3", start, window_end)
+    leave = body.find(b"\xc9\xc3", start, window_end)
+    if leave >= 0 and (pop < 0 or leave < pop):
         return leave, leave
-
-    return None
+    if pop < 4:
+        return None
+    add = None
+    for rel in range(max(0, pop - 16), pop - 2):
+        if body[rel:rel + 3] == b"\x48\x83\xc4":       # add $imm8, %rsp
+            add = rel
+        elif body[rel:rel + 3] == b"\x48\x81\xc4":     # add $imm32, %rsp
+            add = rel
+    return (add if add is not None else pop), pop
 
 
 def patch_gate4a_user_input_step(data, funcs, text_va, text_off, arch):
@@ -828,56 +931,93 @@ def _scan_oneharness_arm64(body):
     return None
 
 
-def _scan_oneharness_x86(body):
-    """Find `cmp $0xe,%r32 ; je ; cmp $0x17,%r32 ; jne ; xor %r32,%r32`.
-
-    Returns (je_rel, zero_rel) or None.
-    """
+def _x86_match_cmp_imm8(body, pos, rex, modrm, imm8):
     n = len(body)
-    for rel in range(0, max(0, n - 16)):
-        if body[rel] == 0x83:
-            rex, modrm, c0, je_rel = None, body[rel + 1], rel, rel + 3
-        elif body[rel] == 0x41 and rel + 4 < n and body[rel + 1] == 0x83:
-            rex, modrm, c0, je_rel = 0x41, body[rel + 2], rel + 1, rel + 4
-        else:
-            continue
-        if not 0xF8 <= modrm <= 0xFF or body[c0 + 2] != 0x0E:
-            continue
-        if je_rel + 1 >= n or body[je_rel] != 0x74:          # je rel8
-            continue
-        c17 = je_rel + 2
-        if rex is not None:
-            if c17 + 3 >= n or body[c17] != 0x41 or body[c17 + 1] != 0x83:
-                continue
-            if body[c17 + 2] != modrm or body[c17 + 3] != 0x17:
-                continue
-            jne = c17 + 4
-        else:
-            if c17 + 2 >= n or body[c17] != 0x83:
-                continue
-            if body[c17 + 1] != modrm or body[c17 + 2] != 0x17:
-                continue
-            jne = c17 + 3
-        if jne + 1 >= n or body[jne] != 0x75:                # jne rel8
-            continue
-        zero_rel = _x86_find_zeroing_xor(body, jne + 2)
-        if zero_rel is not None:
-            return je_rel, zero_rel
+    if rex is not None:
+        if pos + 4 <= n and body[pos] == rex and body[pos + 1] == 0x83 and body[pos + 2] == modrm and body[pos + 3] == imm8:
+            return pos + 4
+        return None
+    if pos + 3 <= n and body[pos] == 0x83 and body[pos + 1] == modrm and body[pos + 2] == imm8:
+        return pos + 3
     return None
+
+
+def _x86_zero_insn_len(body, pos):
+    """Return byte length (2 or 3) of `xor %r32,%r32` at `pos`, else 0."""
+    n = len(body)
+    if pos + 2 <= n and body[pos] == 0x31:
+        modrm = body[pos + 1]
+        if modrm >> 6 == 3 and (modrm >> 3) & 7 == modrm & 7:
+            return 2
+    if pos + 3 <= n and body[pos] == 0x45 and body[pos + 1] == 0x31:
+        modrm = body[pos + 2]
+        if modrm >> 6 == 3 and (modrm >> 3) & 7 == modrm & 7:
+            return 3
+    return 0
 
 
 def _x86_find_zeroing_xor(body, start):
     """Locate `xor %r32,%r32` (or `45 31 ..` r8d-r15d form) at/after `start`."""
     n = len(body)
     for rel in range(start, min(n - 2, start + 48)):
-        if body[rel] == 0x31:
-            modrm = body[rel + 1]
-            if modrm >> 6 == 3 and (modrm >> 3) & 7 == modrm & 7:
-                return rel
-        if rel + 2 < n and body[rel] == 0x45 and body[rel + 1] == 0x31:
-            modrm = body[rel + 2]
-            if modrm >> 6 == 3 and (modrm >> 3) & 7 == modrm & 7:
-                return rel
+        if _x86_zero_insn_len(body, rel) > 0:
+            return rel
+    return None
+
+
+def _scan_oneharness_x86(body):
+    """Find the OneHarness `0xe` / `0x17` step-type dispatch in x86-64 code.
+
+    Supports both compiler branch layouts:
+      - ("je", je_rel, zero_rel):
+            cmp $0xe,%r32 ; je <64k> ; cmp $0x17,%r32 ; jne <16k> ; xor %rDst,%rDst
+      - ("jne_fallthrough", fall_start, patched_fall):
+            cmp $0xe,%r32 ; jne <c17> ; <load 64k> ; jmp <merge>
+        c17:cmp $0x17,%r32 ; jne <16k> ; xor %rDst,%rDst ; jmp <merge>
+    """
+    n = len(body)
+    for rel in range(0, max(0, n - 16)):
+        if body[rel] == 0x83:
+            rex, modrm, c0, br_rel = None, body[rel + 1], rel, rel + 3
+        elif body[rel] == 0x41 and rel + 4 < n and body[rel + 1] == 0x83:
+            rex, modrm, c0, br_rel = 0x41, body[rel + 2], rel + 1, rel + 4
+        else:
+            continue
+        if not 0xF8 <= modrm <= 0xFF or body[c0 + 2] != 0x0E or br_rel + 1 >= n:
+            continue
+
+        op = body[br_rel]
+        if op == 0x74:  # je rel8
+            jne = _x86_match_cmp_imm8(body, br_rel + 2, rex, modrm, 0x17)
+            if jne is None or jne + 1 >= n or body[jne] != 0x75:
+                continue
+            zero_rel = _x86_find_zeroing_xor(body, jne + 2)
+            if zero_rel is not None:
+                return ("je", br_rel, zero_rel)
+
+        elif op == 0x75:  # jne rel8 (Go 1.24+ x86-64 fallthrough layout)
+            disp0 = body[br_rel + 1]
+            if not 4 <= disp0 <= 32:
+                continue
+            fall_start = br_rel + 2
+            c17 = fall_start + disp0
+            if c17 > n or body[c17 - 2] != 0xEB:  # fallthrough ends in jmp rel8
+                continue
+            merge_from_0e = c17 + struct.unpack_from("<b", body, c17 - 1)[0]
+            jne = _x86_match_cmp_imm8(body, c17, rex, modrm, 0x17)
+            if jne is None or jne + 1 >= n or body[jne] != 0x75:
+                continue
+            zero_rel = jne + 2
+            zlen = _x86_zero_insn_len(body, zero_rel)
+            jmp17 = zero_rel + zlen
+            if zlen == 0 or jmp17 + 1 >= n or body[jmp17] != 0xEB:
+                continue
+            merge_from_17 = (jmp17 + 2) + struct.unpack_from("<b", body, jmp17 + 1)[0]
+            slot_len = (c17 - 2) - fall_start
+            if merge_from_0e != merge_from_17 or slot_len < zlen:
+                continue
+            patched_fall = body[zero_rel:zero_rel + zlen] + (b"\x90" * (slot_len - zlen))
+            return ("jne_fallthrough", fall_start, patched_fall)
     return None
 
 
@@ -906,73 +1046,29 @@ def patch_gate4b_oneharness_user_input(data, funcs, text_va, text_off, arch):
                       f"@ {fn_va + beq_rel:#x}")
 
     found = _scan_oneharness_x86(body)
-    if found is not None:
-        je_rel, zero_rel = found
-        patched_disp = zero_rel - (je_rel + 2)
-        if not 0 <= patched_disp <= 0x7F:
-            raise PatchError(f"{FUNC_ONEHARNESS_STEP}: x86-64 je target out of range")
-        if body[je_rel + 1] == patched_disp:
+    if found is None:
+        raise PatchError(f"{FUNC_ONEHARNESS_STEP}: x86-64 OneHarness step "
+                         f"dispatch not found")
+    if found[0] == "jne_fallthrough":
+        _, fall_start, patched_fall = found
+        end = fall_start + len(patched_fall)
+        if body[fall_start:end] == patched_fall:
             return False, f"[Gate 4B] {FUNC_ONEHARNESS_STEP}: already patched"
-        data[fn_off + je_rel + 1] = patched_disp
+        data[fn_off + fall_start:fn_off + end] = patched_fall
         return True, (f"[Gate 4B] {FUNC_ONEHARNESS_STEP}: routed "
                       f"STEP_TYPE_USER_INPUT (0xe) to zero limit "
-                      f"@ {fn_va + je_rel:#x}")
+                      f"@ {fn_va + fall_start:#x}")
 
-    # Fallback: scan for inverted branch pattern (cmp $0xe ; jne <c17> ; <load> ; jmp <end> ; cmp $0x17 ; jne ; <zero_xor>)
-    for rel in range(len(body) - 32):
-        modrm = None
-        if body[rel] == 0x83 and 0xF8 <= body[rel + 1] <= 0xFF and body[rel + 2] == 0x0E:
-            modrm = body[rel + 1]
-            jne_rel = rel + 3
-        elif body[rel] == 0x41 and rel + 4 < len(body) and body[rel + 1] == 0x83 and 0xF8 <= body[rel + 2] <= 0xFF and body[rel + 3] == 0x0E:
-            modrm = body[rel + 2]
-            jne_rel = rel + 4
-        else:
-            continue
-
-        if jne_rel + 2 >= len(body) or body[jne_rel] != 0x75:
-            continue
-        disp = body[jne_rel + 1]
-        c17_rel = jne_rel + 2 + disp
-        if c17_rel + 6 >= len(body):
-            continue
-
-        if not ((body[c17_rel] == 0x83 and body[c17_rel + 1] == modrm and body[c17_rel + 2] == 0x17) or
-                (body[c17_rel] == 0x41 and body[c17_rel + 1] == 0x83 and body[c17_rel + 2] == modrm and body[c17_rel + 3] == 0x17)):
-            continue
-
-        zero_rel = _x86_find_zeroing_xor(body, c17_rel + 3)
-        if zero_rel is None:
-            continue
-
-        if body[zero_rel] == 0x31:
-            zero_bytes = body[zero_rel:zero_rel + 2]
-        elif body[zero_rel] == 0x45 and body[zero_rel + 1] == 0x31:
-            zero_bytes = body[zero_rel:zero_rel + 3]
-        else:
-            continue
-
-        user_load_rel = jne_rel + 2
-        jmp_found = None
-        for j in range(user_load_rel, c17_rel):
-            if body[j] in (0xEB, 0xE9):
-                jmp_found = j
-                break
-        if jmp_found is None:
-            continue
-        load_len = jmp_found - user_load_rel
-        if load_len < len(zero_bytes):
-            continue
-
-        patch_bytes = zero_bytes + b"\x90" * (load_len - len(zero_bytes))
-        if body[user_load_rel:user_load_rel + load_len] == patch_bytes:
-            return False, f"[Gate 4B] {FUNC_ONEHARNESS_STEP}: already patched"
-
-        data[fn_off + user_load_rel:fn_off + user_load_rel + load_len] = patch_bytes
-        return True, (f"[Gate 4B] {FUNC_ONEHARNESS_STEP}: replaced user-step clamp with zero limit "
-                      f"@ {fn_va + user_load_rel:#x}")
-
-    raise PatchError(f"{FUNC_ONEHARNESS_STEP}: x86-64 OneHarness step dispatch not found")
+    _, je_rel, zero_rel = found
+    patched_disp = zero_rel - (je_rel + 2)
+    if not 0 <= patched_disp <= 0x7F:
+        raise PatchError(f"{FUNC_ONEHARNESS_STEP}: x86-64 je target out of range")
+    if body[je_rel + 1] == patched_disp:
+        return False, f"[Gate 4B] {FUNC_ONEHARNESS_STEP}: already patched"
+    data[fn_off + je_rel + 1] = patched_disp
+    return True, (f"[Gate 4B] {FUNC_ONEHARNESS_STEP}: routed "
+                  f"STEP_TYPE_USER_INPUT (0xe) to zero limit "
+                  f"@ {fn_va + je_rel:#x}")
 
 
 # --------------------------------------------------------------------------
@@ -1096,8 +1192,58 @@ def resign(path, entitlements_xml=None, identifier=None):
             os.unlink(ent_file)
 
 
+def _strip_pe_authenticode(data):
+    """Clear PE CheckSum and trailing Authenticode Certificate Table after patching."""
+    if data[:2] != b"MZ":
+        return
+    pe = struct.unpack_from("<I", data, 0x3C)[0]
+    if pe + 24 > len(data) or data[pe:pe + 4] != b"PE\0\0":
+        return
+    opt = pe + 24
+    magic = struct.unpack_from("<H", data, opt)[0]
+    dd_sec = opt + (144 if magic == 0x20B else 128 if magic == 0x10B else 0)
+    if dd_sec == 0 or dd_sec + 8 > len(data):
+        return
+    struct.pack_into("<I", data, opt + 64, 0)
+    cert_off, cert_size = struct.unpack_from("<II", data, dd_sec)
+    if cert_off > 0 and cert_size > 0:
+        struct.pack_into("<II", data, dd_sec, 0, 0)
+        if cert_off + cert_size == len(data):
+            del data[cert_off:]
+
+
+def _default_binary_path():
+    if sys.platform == "win32":
+        local_app = os.environ.get("LOCALAPPDATA") or os.path.join(
+            os.path.expanduser("~"), "AppData", "Local"
+        )
+        return os.path.join(local_app, "agy", "bin", "agy.exe")
+    return os.path.expanduser("~/.local/bin/agy")
+
+
+def _running_pids_for_binary(src):
+    if sys.platform == "win32":
+        exe_name = os.path.basename(src)
+        res = subprocess.run(
+            ["tasklist", "/FI", f"IMAGENAME eq {exe_name}", "/NH", "/FO", "CSV"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        pids = []
+        for line in res.stdout.splitlines():
+            parts = [p.strip('"') for p in line.split('","')]
+            if len(parts) >= 2 and parts[0].lower() == exe_name.lower() and parts[1].isdigit():
+                pids.append(parts[1])
+        return pids
+    running = subprocess.run(["pgrep", "-f", src], capture_output=True, text=True)
+    return [p for p in running.stdout.split() if p != str(os.getpid())]
+
+
 def write_atomic_signed(dst, data, src_for_entitlements=None, make_backup=False):
     """Write to a fresh inode, sign, then os.replace() to refresh macOS cs_blob cache."""
+    _strip_pe_authenticode(data)
     ent_xml = _extract_adhoc_safe_entitlements(src_for_entitlements or dst)
     ident = _extract_identifier(src_for_entitlements or dst)
     if make_backup and os.path.exists(dst):
@@ -1112,7 +1258,13 @@ def write_atomic_signed(dst, data, src_for_entitlements=None, make_backup=False)
             fh.write(data)
         os.chmod(tmp, 0o755)
         resign(tmp, entitlements_xml=ent_xml, identifier=ident)
-        os.replace(tmp, dst)
+        try:
+            os.replace(tmp, dst)
+        except PermissionError as exc:
+            raise PatchError(
+                f"cannot overwrite {dst} ({exc.strerror or 'access denied'}); "
+                f"quit any running {os.path.basename(dst)} processes and retry"
+            ) from exc
     except Exception:
         if os.path.exists(tmp):
             os.unlink(tmp)
@@ -1130,10 +1282,15 @@ def write_atomic_signed(dst, data, src_for_entitlements=None, make_backup=False)
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):
+        reconf = getattr(stream, "reconfigure", None)
+        if callable(reconf):
+            reconf(encoding="utf-8", errors="replace")
+
     ap = argparse.ArgumentParser(
         description="Unlock all context-window gates (4A/4B) in the agy CLI."
     )
-    ap.add_argument("--binary", default=os.path.expanduser("~/.local/bin/agy"))
+    ap.add_argument("--binary", default=_default_binary_path())
     ap.add_argument("--no-env-fix", action="store_true",
                     help="skip optional AGY_CLI_AUTO_COMPACT_OVERRIDE restore")
     ap.add_argument("--no-backup", action="store_true",
@@ -1141,8 +1298,8 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--in-place", action="store_true")
     ap.add_argument("--locate", action="store_true", help="print target symbols only")
-    ap.add_argument("--limit", choices=["512k", "1m"], default="512k",
-                    help="checkpoint ceiling for Gate 3A (default: 512k)")
+    ap.add_argument("--limit", choices=["512k", "1m"], default="1m",
+                    help="checkpoint ceiling for Gate 3A (default: 1m)")
     args = ap.parse_args()
 
     src = os.path.abspath(os.path.expanduser(args.binary))
@@ -1153,13 +1310,11 @@ def main():
         data = bytearray(fh.read())
     before = hashlib.sha256(data).hexdigest()
 
-    if sys.platform != "win32":
-        running = subprocess.run(["pgrep", "-f", src], capture_output=True, text=True)
-        pids = [p for p in running.stdout.split() if p != str(os.getpid())]
-        if pids:
-            print(f"[!] {len(pids)} process(es) are running this binary "
-                  f"(pid {', '.join(pids[:5])}); quit them first or the running "
-                  f"copy keeps executing the old code")
+    pids = _running_pids_for_binary(src)
+    if pids:
+        print(f"[!] {len(pids)} process(es) are running this binary "
+              f"(pid {', '.join(pids[:5])}); quit them first or replacing / "
+              f"reloading the binary may fail")
 
     text_va, text_off, arch = find_text_section(data)
     funcs = build_functions(bytes(data))
@@ -1189,11 +1344,23 @@ def main():
     if args.locate:
         return
 
-    gate3a = lambda d, f, va, off, a: patch_gate3a_checkpoint(d, f, va, off, a, limit=args.limit)
     is_server_only = (FUNC_OFFERS not in funcs and FUNC_STORE_CW not in funcs)
+    base_lower = os.path.basename(src).lower()
+    if is_server_only and (base_lower == "agy" or base_lower.startswith("agy.")):
+        raise PatchError(
+            f"{src} is missing CLI context-window symbols (outdated agy < 1.4); "
+            f"upgrade first with `agy update` or reinstall from "
+            f"https://antigravity.google/docs/install?tab=cli"
+        )
+    gate3a = lambda d, f, va, off, a: patch_gate3a_checkpoint(d, f, va, off, a, limit=args.limit)
     if is_server_only:
-        print(f"[i] mode   : standalone language_server (Gate 3A [{args.limit}] + Gate 3B)")
-        patch_pipeline = (gate3a, patch_gate3b_exp_checkpoint)
+        print(f"[i] mode   : standalone language_server (Gate 3A [{args.limit}] + 3B + 4A/4B)")
+        patch_pipeline = (
+            gate3a,
+            patch_gate3b_exp_checkpoint,
+            patch_gate4a_user_input_step,
+            patch_gate4b_oneharness_user_input,
+        )
     else:
         patch_pipeline = (
             patch_gate1_ui,
